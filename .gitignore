@@ -1,3 +1,4 @@
+# ── Secrets (NEVER commit) ──
 .env
 .env.local
 .env.*.local
@@ -5,6 +6,7 @@
 *.key
 secrets/
 
+# ── Python ──
 __pycache__/
 *.py[cod]
 *$py.class
@@ -19,7 +21,9 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+src/*.egg-info/
 
+# ── Node / pnpm ──
 node_modules/
 .next/
 .turbo/
@@ -27,15 +31,19 @@ out/
 .pnpm-store/
 .npm/
 
+# ── OS / Editor ──
 .DS_Store
 .idea/
 .vscode/
 *.log
 
+# ── Docker volumes (local data) ──
 docker-volumes/
 postgres-data/
 langfuse-data/
 
+# ── Mission / Benchmark artifacts ──
 mission-artifacts/runs/
 mission-artifacts/**/runs/
 swebench-cache/
+benchmarks/results/
