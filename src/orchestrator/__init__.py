@@ -48,10 +48,7 @@ _BRANCH_PREFIX = "sdlc-swarm/"
 
 
 class OrchestratorState(BaseModel):
-    """State that flows through the LangGraph nodes.
-
-    This is the typed state that each node reads and writes.
-    """
+    """State that flows through the LangGraph nodes."""
 
     task_id: str = ""
     repo_url: str = ""
@@ -81,14 +78,19 @@ class OrchestratorState(BaseModel):
     model_config = {"arbitrary_types_allowed": True}
 
 
-# ── Node functions ──────────────────────────────────────────────────
+# ── Node function ────────────────────────────────────────────────────
 
 
-async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
-    """Node: Run the single-agent topology.
+async def run_single_agent_e2e(
+    state: OrchestratorState,
+) -> dict[str, Any]:
+    """Node: Run the single-agent topology end-to-end.
 
-    Creates a PydanticAI agent with all tools, feeds it the issue
-    context, and collects the typed output.
+    This single node handles the full pipeline in one sandbox
+    session: clone → agent edits/tests → commit → PR open.
+
+    Keeping everything in one sandbox avoids the problem of
+    losing agent edits between nodes.
     """
     task_id = state.task_id
     repo_url = state.repo_url
@@ -96,10 +98,12 @@ async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
     issue_number = state.issue_number
 
     logger.info(
-        "Running single_agent for task %s (issue #%d)", task_id, issue_number
+        "Running single_agent e2e for task %s (issue #%d)",
+        task_id,
+        issue_number,
     )
 
-    # Create a fresh sandbox for this run
+    # Create sandbox
     sandbox = SandboxManager(task_id=task_id)
     await sandbox.setup()
 
@@ -112,19 +116,24 @@ async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
         gh_client.clone(repo_url, str(sandbox.workspace_dir))
     except Exception as exc:
         logger.error("Clone failed for task %s: %s", task_id, exc)
-        await sandbox.teardown()
-        return {"errors": [f"Clone failed: {exc}"], "outcome": "sandbox_failure"}
+        with contextlib.suppress(Exception):
+            await sandbox.teardown()
+        return {
+            "errors": [f"Clone failed: {exc}"],
+            "outcome": "sandbox_failure",
+            "status": "failed",
+        }
 
-    # Create trace in Langfuse
+    # Create trace in Langfuse (trace_id must be 32 lowercase hex chars)
     tracing = get_tracing_client()
-    trace_id = str(uuid4())
+    trace_id = uuid4().hex
     trace_span_id = tracing.create_trace(
         trace_id=trace_id,
         name=f"task.{task_id}.single_agent",
         metadata={"task_id": task_id, "topology": "single_agent"},
     )
 
-    # Create agent span
+    # Create agent span — this is the single agent in the trace
     agent_span_id = tracing.create_span(
         trace_id=trace_id,
         parent_span_id=trace_span_id,
@@ -181,6 +190,11 @@ async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
     )
 
     # Run the agent
+    agent_output: SingleAgentOutput | None = None
+    cost_usd = Decimal("0")
+    tokens_in = 0
+    tokens_out = 0
+
     try:
         result = await single_agent.run(
             issue_context.model_dump_json(),
@@ -189,11 +203,6 @@ async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
         agent_output = result.output
 
         # Accumulate cost from the agent run
-        cost_usd = Decimal("0")
-        tokens_in = 0
-        tokens_out = 0
-        cached_tokens = 0
-
         if hasattr(result, "usage") and result.usage:
             usage = result.usage
             tokens_in = getattr(usage, "request_tokens", 0) or 0
@@ -201,7 +210,7 @@ async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
 
         # Estimate cost based on token usage
         cost_usd = estimate_cost_tiktoken(
-            model="deepseek/deepseek-v4-flash",
+            model="deepseek/deepseek-chat-v3-0324",
             prompt_tokens=tokens_in,
             completion_tokens=tokens_out,
         )
@@ -217,7 +226,8 @@ async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
                 new_total,
                 max_cost,
             )
-            await sandbox.teardown()
+            with contextlib.suppress(Exception):
+                await sandbox.teardown()
             return {
                 "outcome": "cost_budget_exhausted",
                 "total_cost_usd": new_total,
@@ -250,7 +260,6 @@ async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
                 span_type=SpanType.SPAN,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
-                cached_tokens=cached_tokens,
                 cost_usd=cost_usd,
                 metadata={"agent_name": "single_agent"},
             )
@@ -263,15 +272,6 @@ async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
             cost_usd,
         )
 
-        return {
-            "agent_output": agent_output,
-            "total_cost_usd": new_total,
-            "total_tokens_in": state.total_tokens_in + tokens_in,
-            "total_tokens_out": state.total_tokens_out + tokens_out,
-            "total_tokens_cached": state.total_tokens_cached + cached_tokens,
-            "status": "completed" if agent_output.ready_for_pr else "running",
-        }
-
     except Exception as exc:
         logger.error("Agent failed for task %s: %s", task_id, exc)
         tracing.update_span(
@@ -281,91 +281,88 @@ async def run_single_agent(state: OrchestratorState) -> dict[str, Any]:
             end_time=datetime.now(UTC),
             level="ERROR",
         )
-        await sandbox.teardown()
-        return {"errors": [f"Agent failed: {exc}"], "outcome": "failed"}
-
-    finally:
         with contextlib.suppress(Exception):
             await sandbox.teardown()
-
-        # Flush tracing
         tracing.flush()
-
-
-async def commit_and_pr(state: OrchestratorState) -> dict[str, Any]:
-    """Node: Commit changes and open a PR.
-
-    Only runs if the agent output has ready_for_pr=True.
-    """
-    task_id = state.task_id
-    repo_url = state.repo_url
-
-    if state.agent_output is None or not state.agent_output.ready_for_pr:
-        logger.info("Task %s not ready for PR, skipping", task_id)
-        return {"outcome": "completed", "status": "completed"}
-
-    logger.info("Opening PR for task %s", task_id)
-
-    pat = os.getenv("GITHUB_PAT", "")
-    username = os.getenv("GITHUB_USERNAME", "")
-    gh_client = GitHubClient(pat=pat, username=username)
-
-    repo_slug = canonicalize_repo_url(repo_url).replace(
-        "https://github.com/", ""
-    )
-
-    # Clone the repo fresh for commit+push
-    sandbox = SandboxManager(task_id=task_id)
-    await sandbox.setup()
-
-    try:
-        gh_client.clone(repo_url, str(sandbox.workspace_dir))
-
-        # Create branch
-        branch_name = f"{_BRANCH_PREFIX}fix-issue-{state.issue_number}"
-        gh_client.create_branch(str(sandbox.workspace_dir), branch_name)
-
-        # Apply the agent's code edit
-        if state.agent_output.code_edit.diff:
-            with contextlib.suppress(Exception):
-                await sandbox.apply_diff(state.agent_output.code_edit.diff)
-
-        # Commit and push
-        summary = state.agent_output.summary[:200]
-        commit_msg = (
-            f"fix: resolve issue #{state.issue_number}\n\n{summary}"
-        )
-        gh_client.commit_and_push(
-            str(sandbox.workspace_dir), branch_name, commit_msg
-        )
-
-        # Open PR
-        pr_title = f"fix: resolve issue #{state.issue_number}"
-        pr_body = (
-            state.agent_output.summary
-            or f"Automated fix for issue #{state.issue_number}"
-        )
-        pr_ref = gh_client.open_pull_request(
-            repo=repo_slug,
-            head_branch=branch_name,
-            title=pr_title,
-            body=pr_body,
-        )
-
-        logger.info("PR opened: %s", pr_ref.html_url)
         return {
-            "pr_url": pr_ref.html_url,
-            "outcome": "pr_opened",
-            "status": "completed",
+            "errors": [f"Agent failed: {exc}"],
+            "outcome": "sandbox_failure",
+            "total_cost_usd": cost_usd,
+            "status": "failed",
         }
 
-    except Exception as exc:
-        logger.error("PR failed for task %s: %s", task_id, exc)
-        return {"errors": [f"PR failed: {exc}"], "outcome": "failed"}
+    # ── Commit and PR (same sandbox) ──────────────────────────────
 
-    finally:
-        with contextlib.suppress(Exception):
-            await sandbox.teardown()
+    pr_url = ""
+
+    if agent_output is not None and agent_output.ready_for_pr:
+        try:
+            repo_slug = canonicalize_repo_url(repo_url).replace(
+                "https://github.com/", ""
+            )
+
+            # Create branch
+            branch_name = f"{_BRANCH_PREFIX}fix-issue-{issue_number}"
+            gh_client.create_branch(
+                str(sandbox.workspace_dir), branch_name
+            )
+
+            # Commit and push (agent's edits are already in the sandbox)
+            summary = agent_output.summary[:200]
+            commit_msg = (
+                f"fix: resolve issue #{issue_number}\n\n{summary}"
+            )
+            gh_client.commit_and_push(
+                str(sandbox.workspace_dir), branch_name, commit_msg
+            )
+
+            # Open PR
+            pr_title = f"fix: resolve issue #{issue_number}"
+            pr_body = (
+                agent_output.summary
+                or f"Automated fix for issue #{issue_number}"
+            )
+            pr_ref = gh_client.open_pull_request(
+                repo=repo_slug,
+                head_branch=branch_name,
+                title=pr_title,
+                body=pr_body,
+            )
+
+            pr_url = pr_ref.html_url
+            logger.info("PR opened: %s", pr_url)
+
+        except Exception as exc:
+            logger.error("PR failed for task %s: %s", task_id, exc)
+
+    # Teardown sandbox
+    with contextlib.suppress(Exception):
+        await sandbox.teardown()
+
+    # Flush tracing
+    tracing.flush()
+
+    # Determine outcome
+    if pr_url:
+        outcome = "pr_opened"
+        status = "completed"
+    elif agent_output is not None and agent_output.ready_for_pr:
+        outcome = "sandbox_failure"  # PR step failed
+        status = "failed"
+    else:
+        outcome = "success"  # Agent ran but not ready for PR
+        status = "completed"
+
+    return {
+        "agent_output": agent_output,
+        "total_cost_usd": state.total_cost_usd + cost_usd,
+        "total_tokens_in": state.total_tokens_in + tokens_in,
+        "total_tokens_out": state.total_tokens_out + tokens_out,
+        "total_tokens_cached": state.total_tokens_cached,
+        "pr_url": pr_url,
+        "outcome": outcome,
+        "status": status,
+    }
 
 
 # ── Build the single_agent graph ────────────────────────────────────
@@ -374,21 +371,19 @@ async def commit_and_pr(state: OrchestratorState) -> dict[str, Any]:
 def build_single_agent_graph() -> StateGraph:
     """Build the LangGraph state machine for the single_agent topology.
 
-    The graph is linear: START → run_single_agent → commit_and_pr → END
+    The graph is linear: START → run_single_agent_e2e → END
 
     The Langfuse trace will contain exactly one distinct agent name
     "single_agent" (VAL-TOPOLOGY-001).
     """
     graph = StateGraph(OrchestratorState)
 
-    # Add nodes
-    graph.add_node("run_single_agent", run_single_agent)
-    graph.add_node("commit_and_pr", commit_and_pr)
+    # Add single node that handles the full pipeline
+    graph.add_node("run_single_agent_e2e", run_single_agent_e2e)
 
     # Add edges
-    graph.add_edge(START, "run_single_agent")
-    graph.add_edge("run_single_agent", "commit_and_pr")
-    graph.add_edge("commit_and_pr", END)
+    graph.add_edge(START, "run_single_agent_e2e")
+    graph.add_edge("run_single_agent_e2e", END)
 
     return graph
 

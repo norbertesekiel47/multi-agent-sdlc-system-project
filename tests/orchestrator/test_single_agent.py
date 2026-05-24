@@ -35,18 +35,16 @@ class TestSingleAgentGraph:
     def test_graph_has_exactly_one_agent_node(self) -> None:
         """VAL-TOPOLOGY-001: single_agent topology has exactly one agent node."""
         graph = build_single_agent_graph()
-        # The graph should have exactly the agent node plus the commit node
-        # The agent name in the graph is "single_agent"
         node_names = set(graph.nodes.keys())
         # Filter out __start__ and __end__
         agent_nodes = {n for n in node_names if not n.startswith("__")}
-        # "run_single_agent" is the only agent-related node
-        assert "run_single_agent" in agent_nodes
+        # "run_single_agent_e2e" is the only agent-related node
+        assert "run_single_agent_e2e" in agent_nodes
         # The agent name used in Langfuse spans will be "single_agent"
         # which is exactly 1 distinct agent name
 
     def test_graph_linear_flow(self) -> None:
-        """single_agent graph follows linear flow: start → agent → commit → end."""
+        """single_agent graph follows linear flow: start → e2e → end."""
         graph = build_single_agent_graph()
         compiled = graph.compile()
         # Verify the graph compiles without error

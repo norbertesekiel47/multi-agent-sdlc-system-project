@@ -26,7 +26,8 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Model ID per architecture §2.3 / §5
-_SINGLE_AGENT_MODEL = "openrouter:deepseek/deepseek-v4-flash"
+# Using deepseek-chat-v3-0324 which is stable on OpenRouter
+_SINGLE_AGENT_MODEL = "openrouter:deepseek/deepseek-chat-v3-0324"
 
 # Default test command
 _DEFAULT_TEST_CMD = "python -m pytest tests/ -v"
