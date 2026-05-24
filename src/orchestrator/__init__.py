@@ -19,7 +19,13 @@ from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
-from src.agents.models import IssueContext, SingleAgentOutput
+from src.agents.models import (
+    ChangePlan,
+    CodeEdit,
+    IssueContext,
+    ReviewResult,
+    SingleAgentOutput,
+)
 from src.agents.single_agent import SandboxTools, single_agent
 from src.github_client.client import GitHubClient, canonicalize_repo_url
 from src.llm.cost import estimate_cost_tiktoken, get_max_cost_per_task
@@ -48,7 +54,12 @@ _BRANCH_PREFIX = "sdlc-swarm/"
 
 
 class OrchestratorState(BaseModel):
-    """State that flows through the LangGraph nodes."""
+    """State that flows through the LangGraph nodes.
+
+    Fields shared by all topologies (single_agent, supervisor_only, hybrid).
+    The supervisor_only topology additionally uses change_plan,
+    code_edit, review_result for sequential agent-to-agent routing.
+    """
 
     task_id: str = ""
     repo_url: str = ""
@@ -57,9 +68,22 @@ class OrchestratorState(BaseModel):
     topology: str = "single_agent"
     status: str = "running"
 
-    # Agent outputs
+    # Agent outputs (single_agent)
     issue_context: IssueContext | None = None
     agent_output: SingleAgentOutput | None = None
+
+    # Agent outputs (supervisor_only / hybrid)
+    change_plan: ChangePlan | None = None
+    code_edit: CodeEdit | None = None
+    review_result: ReviewResult | None = None
+
+    # Step tracking (supervisor_only / hybrid)
+    step_index: int = 0
+    retry_counters: dict[str, int] = {}
+
+    # Langfuse trace IDs (supervisor_only / hybrid)
+    trace_id: str = ""
+    supervisor_span_id: str = ""
 
     # Cost tracking
     total_cost_usd: Decimal = Decimal("0")
@@ -408,10 +432,12 @@ class Orchestrator:
 
         Steps:
         1. Load the task from the episodic store
-        2. Build the appropriate LangGraph topology
-        3. Execute the graph
-        4. Persist outcomes and update task status
-        5. Return the final state
+        2. For supervisor_only: provision sandbox + clone repo
+        3. Build the appropriate LangGraph topology
+        4. Execute the graph
+        5. For supervisor_only: teardown sandbox
+        6. Persist outcomes and update task status
+        7. Return the final state
         """
         task = await self.store.get_task(UUID(task_id))
         if task is None:
@@ -436,13 +462,50 @@ class Orchestrator:
             status="running",
         )
 
-        # Build and compile the graph
-        if task.topology == "single_agent":
+        # For supervisor_only, provision sandbox + clone before the graph
+        sandbox: SandboxManager | None = None
+        if task.topology == "supervisor_only":
+            from src.orchestrator.supervisor_only import (
+                build_supervisor_only_graph,
+                register_sandbox,
+                register_store,
+                unregister_sandbox,
+                unregister_store,
+            )
+
+            sandbox = SandboxManager(task_id=task_id)
+            try:
+                await sandbox.setup()
+                pat = os.getenv("GITHUB_PAT", "")
+                username = os.getenv("GITHUB_USERNAME", "")
+                gh_client = GitHubClient(pat=pat, username=username)
+                gh_client.clone(task.repo_url, str(sandbox.workspace_dir))
+            except Exception as exc:
+                logger.error("Sandbox/clone failed for task %s: %s", task_id, exc)
+                with contextlib.suppress(Exception):
+                    await sandbox.teardown()
+                await self.store.finish_task(UUID(task_id), "failed")
+                await self.store.create_outcome(
+                    CreateOutcomeParams(
+                        task_id=UUID(task_id),
+                        outcome="sandbox_failure",
+                        detail={"error": f"Clone failed: {exc!s}"[:500]},
+                    )
+                )
+                return initial_state.model_copy(
+                    update={"status": "failed", "outcome": "sandbox_failure"}
+                )
+
+            # Register sandbox and store for node functions
+            register_sandbox(task_id, sandbox)
+            register_store(task_id, self.store)
+            graph = build_supervisor_only_graph()
+        elif task.topology == "single_agent":
             graph = build_single_agent_graph()
         else:
             msg = (
                 f"Topology {task.topology!r} not yet implemented "
-                "(M1 only supports single_agent)"
+                "(M1 only supports single_agent, M2 adds supervisor_only)"
             )
             raise ValueError(msg)
 
@@ -455,6 +518,12 @@ class Orchestrator:
             logger.error(
                 "Graph execution failed for task %s: %s", task_id, exc
             )
+            # Cleanup sandbox if it was provisioned
+            if sandbox is not None:
+                with contextlib.suppress(Exception):
+                    await sandbox.teardown()
+                unregister_sandbox(task_id)
+                unregister_store(task_id)
             await self.store.finish_task(UUID(task_id), "failed")
             await self.store.create_outcome(
                 CreateOutcomeParams(
@@ -469,6 +538,17 @@ class Orchestrator:
 
         # Process the result
         final_state = OrchestratorState.model_validate(result)
+
+        # Teardown sandbox if it was provisioned
+        if sandbox is not None:
+            with contextlib.suppress(Exception):
+                await sandbox.teardown()
+            unregister_sandbox(task_id)
+            unregister_store(task_id)
+
+        # Flush Langfuse traces
+        tracing = get_tracing_client()
+        tracing.flush()
 
         # Update the task in the episodic store
         await self.store.update_task_totals(
