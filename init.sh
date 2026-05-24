@@ -87,7 +87,9 @@ fi
 # --- 8. Database migrations (if src/db/ exists) ---
 if [ -d src/db ] && [ -f src/db/init_schema.py ]; then
   echo "Running database schema initialization..."
-  python -m src.db.init_schema 2>/dev/null || true
+  # Load .env so DB credentials are available
+  set -a; [ -f .env ] && source .env; set +a
+  python -m src.db.init_schema || echo "Warning: DB schema init failed (may need Postgres)"
 fi
 
 echo "=== init.sh complete ==="
