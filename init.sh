@@ -57,12 +57,30 @@ fi
 fnm install 22 2>/dev/null || true
 fnm use 22 2>/dev/null || true
 
-# --- 6. Docker images pre-pull ---
+# --- 6. Build custom sandbox base image (idempotent) ---
+if [ -f infra/sandbox/Dockerfile ]; then
+  echo "Building sandbox base image (sdlc-swarm/sandbox-base:latest)..."
+  docker build -t sdlc-swarm/sandbox-base:latest infra/sandbox/ || {
+    echo "WARNING: Failed to build sandbox base image."
+    echo "The apply_diff tool requires the 'patch' binary in the sandbox."
+    echo "Build manually: docker build -t sdlc-swarm/sandbox-base:latest infra/sandbox/"
+  }
+fi
+
+# --- 7. Build sandbox proxy image (idempotent) ---
+if [ -f infra/sandbox-proxy/Dockerfile ]; then
+  echo "Building sandbox proxy image (sdlc-swarm/sandbox-proxy:latest)..."
+  docker build -t sdlc-swarm/sandbox-proxy:latest infra/sandbox-proxy/ || {
+    echo "WARNING: Failed to build sandbox proxy image."
+  }
+fi
+
+# --- 8. Docker images pre-pull ---
 echo "Pre-pulling Docker images..."
 docker pull pgvector/pgvector:pg17 2>/dev/null || true
 docker pull langfuse/langfuse:3 2>/dev/null || true
 
-# --- 7. Docker Compose stack (if infra/docker-compose.yml exists) ---
+# --- 9. Docker Compose stack (if infra/docker-compose.yml exists) ---
 if [ -f infra/docker-compose.yml ]; then
   echo "Starting Docker Compose stack..."
   docker compose --env-file "$REPO_ROOT/.env" -f infra/docker-compose.yml up -d
@@ -84,7 +102,7 @@ if [ -f infra/docker-compose.yml ]; then
   done
 fi
 
-# --- 8. Database migrations (if src/db/ exists) ---
+# --- 10. Database migrations (if src/db/ exists) ---
 if [ -d src/db ] && [ -f src/db/init_schema.py ]; then
   echo "Running database schema initialization..."
   # Load .env so DB credentials are available

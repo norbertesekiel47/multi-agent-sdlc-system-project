@@ -35,7 +35,7 @@ DEFAULT_ALLOWLIST: list[str] = [
 ]
 
 # ── Base images for sandbox containers ───────────────────
-DEFAULT_SANDBOX_IMAGE: str = os.getenv("SANDBOX_IMAGE", "python:3.12-slim")
+DEFAULT_SANDBOX_IMAGE: str = os.getenv("SANDBOX_IMAGE", "sdlc-swarm/sandbox-base:latest")
 NODE_SANDBOX_IMAGE: str = os.getenv("NODE_SANDBOX_IMAGE", "node:20-slim")
 
 # ── Janitor ──────────────────────────────────────────────
