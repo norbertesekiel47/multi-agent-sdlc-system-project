@@ -232,32 +232,131 @@ async def _handle_guardrail_violation(
     }
 
 
+# ── Guardrail escalation HITL node (VAL-GUARDRAIL-009) ──────────────
+
+
+async def hitl_guardrail_escalation(state: OrchestratorState) -> dict[str, Any]:
+    """Node: HITL interrupt for guardrail violation escalation.
+
+    VAL-GUARDRAIL-009: When a guardrail rule fires, the offending
+    agent is halted and the orchestrator raises a LangGraph interrupt()
+    that surfaces the violation to HITL with the rule name and a
+    human-readable explanation.
+
+    The violating agent node catches the GuardrailViolation, writes
+    the Langfuse span and outcomes row, then routes here.  This node
+    fires interrupt() with the violation details, pausing the graph
+    until a human reviews and resolves the escalation.
+    """
+    task_id = state.task_id
+    logger.warning(
+        "Guardrail escalation HITL interrupt for task %s, outcome=%s",
+        task_id,
+        state.outcome,
+    )
+
+    # Build violation details from the error messages stored in state
+    error_detail = "; ".join(state.errors) if state.errors else "Unknown guardrail violation"
+
+    # Update task status to awaiting_hitl
+    store = get_store(task_id)
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "awaiting_hitl")
+
+    # Broadcast HITL interrupt event for the dashboard
+    broadcaster = get_trace_broadcaster()
+    trace_id = getattr(state, "trace_id", "") or uuid4().hex
+    await broadcaster.publish(
+        TraceEvent(
+            type="hitl_interrupt",
+            task_id=task_id,
+            trace_id=trace_id,
+            span_id="",
+            parent_span_id="",
+            name="hitl_guardrail_escalation",
+            span_type=SpanType.SPAN,
+            metadata={
+                "cause": "guardrail_block",
+                "detail": error_detail,
+                "outcome": state.outcome,
+            },
+        )
+    )
+
+    # Fire the interrupt — graph pauses here (VAL-GUARDRAIL-009)
+    decision = interrupt({
+        "reason": "guardrail_block",
+        "task_id": task_id,
+        "cause": "guardrail_block",
+        "explanation": error_detail,
+    })
+
+    if decision == "reject" or decision is None:
+        # Rejected or dismissed — end the task
+        if store is not None:
+            from src.memory.episodic.models import CreateOutcomeParams
+            await store.finish_task(UUID(task_id), "rejected", hitl_decision="reject")
+            await store.create_outcome(
+                CreateOutcomeParams(
+                    task_id=UUID(task_id),
+                    outcome="hitl_rejected",
+                    detail={"cause": "guardrail_block", "original_errors": state.errors},
+                )
+            )
+        return {"outcome": "hitl_rejected", "status": "rejected"}
+
+    # Approved — the human has acknowledged the guardrail violation
+    # and chosen to proceed (rare, but possible for e.g. rm -rf
+    # inside a temp build directory that happens to be outside cwd)
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "running")
+
+    return {"hitl_decision": "approve", "outcome": "", "status": "running"}
+
+
 # ── Routing functions ───────────────────────────────────────────────
 
 
-def route_after_planner(state: OrchestratorState) -> Literal["run_coder"]:
-    """After Planner completes, always route to Coder.
+def route_after_planner(
+    state: OrchestratorState,
+) -> Literal["hitl_guardrail_escalation", "run_coder"]:
+    """After Planner, route to guardrail escalation or Coder.
 
-    The Planner always succeeds (PydanticAI retries internally)
-    or the orchestrator handles the failure at a higher level.
+    VAL-GUARDRAIL-009: If a guardrail violation was detected in the
+    Planner's tool calls, route to the HITL escalation node instead
+    of continuing to Coder.
     """
+    if state.outcome == "guardrail_block":
+        return "hitl_guardrail_escalation"
     return "run_coder"
 
 
-def route_after_coder(state: OrchestratorState) -> Literal["run_reviewer"]:
-    """After Coder completes, always route to Reviewer.
+def route_after_coder(
+    state: OrchestratorState,
+) -> Literal["hitl_guardrail_escalation", "run_reviewer"]:
+    """After Coder, route to guardrail escalation or Reviewer.
 
-    In supervisor_only, there is no direct Coder→QA path;
-    the Reviewer must always inspect the code first.
+    VAL-GUARDRAIL-009: If a guardrail violation was detected in the
+    Coder's tool calls (e.g. rm -rf outside sandbox), route to the
+    HITL escalation node instead of continuing to Reviewer.
     """
+    if state.outcome == "guardrail_block":
+        return "hitl_guardrail_escalation"
     return "run_reviewer"
 
 
 def route_after_review(
     state: OrchestratorState,
-) -> Literal["run_qa", "run_coder", "run_supervisor_finalize", "halt_retry_exhausted"]:
+) -> Literal[
+    "hitl_guardrail_escalation",
+    "run_qa",
+    "run_coder",
+    "run_supervisor_finalize",
+    "halt_retry_exhausted",
+]:
     """After Reviewer, route based on verdict.
 
+    - ``guardrail_block``: escalate to HITL (VAL-GUARDRAIL-009)
     - ``accept``: advance to QA (VAL-QA-001, VAL-QA-003)
     - ``reject_with_changes``: re-route to Coder (if retry budget
       allows), otherwise halt with retry_budget_exhausted
@@ -270,6 +369,9 @@ def route_after_review(
     VAL-REVIEWER-004: When ReviewResult.verdict == 'accept', the
     orchestrator routes to QA next, not back to Coder.
     """
+    # VAL-GUARDRAIL-009: Check for guardrail violations first
+    if state.outcome == "guardrail_block":
+        return "hitl_guardrail_escalation"
     review = state.review_result
     if review is None:
         # No review result — should not happen, advance to finalize
@@ -909,9 +1011,14 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
 
 def route_after_qa(
     state: OrchestratorState,
-) -> Literal["run_supervisor_finalize", "halt_test_failure"]:
+) -> Literal[
+    "hitl_guardrail_escalation",
+    "run_supervisor_finalize",
+    "halt_test_failure",
+]:
     """After QA, route based on test results.
 
+    - ``guardrail_block``: escalate to HITL (VAL-GUARDRAIL-009)
     - All pass (failed == 0): advance to Supervisor finalize (→ PR)
     - Failures (failed > 0): halt with test failure (VAL-QA-005)
 
@@ -919,6 +1026,10 @@ def route_after_qa(
     NOT proceed to PR creation. It either retries (within budget)
     or escalates to HITL with cause persistent_test_failure.
     """
+    # VAL-GUARDRAIL-009: Check for guardrail violations first
+    if state.outcome == "guardrail_block":
+        return "hitl_guardrail_escalation"
+
     report = state.test_report
     if report is None:
         # No test report — should not happen, advance to finalize
@@ -1708,6 +1819,9 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     graph.add_node("run_commit_and_push", run_commit_and_push)
     graph.add_node("run_open_pr", run_open_pr)
 
+    # ── Guardrail escalation HITL node (VAL-GUARDRAIL-009) ────
+    graph.add_node("hitl_guardrail_escalation", hitl_guardrail_escalation)
+
     # ── Add edges ───────────────────────────────────────────────
 
     # START → Supervisor
@@ -1719,18 +1833,33 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     # Index Repo → Planner (sequential)
     graph.add_edge("index_repo", "run_planner")
 
-    # Planner → Coder (sequential)
-    graph.add_edge("run_planner", "run_coder")
+    # Planner → conditional routing (guardrail check + normal flow)
+    # VAL-GUARDRAIL-009: If guardrail violation, route to escalation
+    graph.add_conditional_edges(
+        "run_planner",
+        route_after_planner,
+        {
+            "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "run_coder": "run_coder",
+        },
+    )
 
-    # Coder → Reviewer (sequential)
-    graph.add_edge("run_coder", "run_reviewer")
+    # Coder → conditional routing (guardrail check + normal flow)
+    graph.add_conditional_edges(
+        "run_coder",
+        route_after_coder,
+        {
+            "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "run_reviewer": "run_reviewer",
+        },
+    )
 
-    # Reviewer → conditional routing (this IS the Supervisor's
-    # routing decision, not a peer handoff)
+    # Reviewer → conditional routing (guardrail check + verdict routing)
     graph.add_conditional_edges(
         "run_reviewer",
         route_after_review,
         {
+            "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "run_qa": "run_qa",  # accept → QA (VAL-REVIEWER-004)
             "run_coder": "run_coder",  # reject_with_changes loop
             "run_supervisor_finalize": "run_supervisor_finalize",  # reject
@@ -1738,11 +1867,12 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         },
     )
 
-    # QA → conditional routing based on test results (VAL-QA-005)
+    # QA → conditional routing (guardrail check + test results)
     graph.add_conditional_edges(
         "run_qa",
         route_after_qa,
         {
+            "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "run_supervisor_finalize": "run_supervisor_finalize",  # all pass → HITL + PR
             "halt_test_failure": "halt_test_failure",  # test failures → halt
         },
@@ -1777,5 +1907,8 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
 
     # Halt test failure → END (VAL-QA-005)
     graph.add_edge("halt_test_failure", END)
+
+    # Guardrail escalation → END (after HITL decision resolved)
+    graph.add_edge("hitl_guardrail_escalation", END)
 
     return graph

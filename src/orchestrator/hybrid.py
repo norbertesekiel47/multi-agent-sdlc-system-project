@@ -90,6 +90,9 @@ from src.orchestrator.supervisor_only import (
     get_sandbox_proxy as get_sandbox_proxy,
 )
 from src.orchestrator.supervisor_only import (
+    hitl_guardrail_escalation as hitl_guardrail_escalation,
+)
+from src.orchestrator.supervisor_only import (
     register_guardrail as register_guardrail,
 )
 from src.orchestrator.supervisor_only import (
@@ -100,6 +103,12 @@ from src.orchestrator.supervisor_only import (
 )
 from src.orchestrator.supervisor_only import (
     register_store as register_store,
+)
+from src.orchestrator.supervisor_only import (
+    route_after_coder as route_after_coder,
+)
+from src.orchestrator.supervisor_only import (
+    route_after_planner as route_after_planner,
 )
 from src.orchestrator.supervisor_only import (
     unregister_guardrail as unregister_guardrail,
@@ -124,11 +133,18 @@ logger = logging.getLogger(__name__)
 
 def route_after_review_hybrid(
     state: OrchestratorState,
-) -> Literal["run_qa", "run_peer_coder", "run_supervisor_finalize", "halt_retry_exhausted"]:
+) -> Literal[
+    "hitl_guardrail_escalation",
+    "run_qa",
+    "run_peer_coder",
+    "run_supervisor_finalize",
+    "halt_retry_exhausted",
+]:
     """After Reviewer, route based on verdict (hybrid topology).
 
     Same as supervisor_only's route_after_review EXCEPT:
 
+    - ``guardrail_block``: escalate to HITL (VAL-GUARDRAIL-009)
     - ``accept``: advance to QA (same as supervisor_only)
     - ``reject_with_changes``: route to **run_peer_coder** (peer
       handoff via swarm edge, NOT through Supervisor).
@@ -138,6 +154,10 @@ def route_after_review_hybrid(
 
     When the retry budget is exhausted, halt with retry_budget_exhausted.
     """
+    # VAL-GUARDRAIL-009: Check for guardrail violations first
+    if state.outcome == "guardrail_block":
+        return "hitl_guardrail_escalation"
+
     review = state.review_result
     if review is None:
         logger.warning("route_after_review_hybrid called with no review_result")
@@ -185,8 +205,16 @@ def route_after_review_hybrid(
 
 def route_after_qa_hybrid(
     state: OrchestratorState,
-) -> Literal["run_supervisor_finalize", "halt_test_failure"]:
+) -> Literal[
+    "hitl_guardrail_escalation",
+    "run_supervisor_finalize",
+    "halt_test_failure",
+]:
     """After QA, route based on test results (same as supervisor_only)."""
+    # VAL-GUARDRAIL-009: Check for guardrail violations first
+    if state.outcome == "guardrail_block":
+        return "hitl_guardrail_escalation"
+
     report = state.test_report
     if report is None:
         logger.warning("route_after_qa_hybrid called with no test_report")
@@ -203,15 +231,14 @@ def route_after_qa_hybrid(
 
 def route_after_peer_coder(
     state: OrchestratorState,
-) -> Literal["run_reviewer_hybrid"]:
-    """After peer Coder, always route to Reviewer (peer loop).
+) -> Literal["hitl_guardrail_escalation", "run_reviewer"]:
+    """After peer Coder, route to guardrail escalation or Reviewer.
 
-    In the swarm segment, after the peer Coder produces a new
-    CodeEdit, it always routes back to the Reviewer.  The Reviewer
-    then decides whether to accept (break out of the loop to QA)
-    or reject_with_changes again (continue the peer loop).
+    VAL-GUARDRAIL-009: If guardrail violation in peer Coder, escalate.
     """
-    return "run_reviewer_hybrid"
+    if state.outcome == "guardrail_block":
+        return "hitl_guardrail_escalation"
+    return "run_reviewer"
 
 
 # ── Node: Reviewer (hybrid) ─────────────────────────────────────────
@@ -696,24 +723,44 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
     graph.add_node("run_commit_and_push", run_commit_and_push)
     graph.add_node("run_open_pr", run_open_pr)
 
+    # ── Guardrail escalation HITL node (VAL-GUARDRAIL-009) ────
+    graph.add_node("hitl_guardrail_escalation", hitl_guardrail_escalation)
+
     # ── Add edges ───────────────────────────────────────────────
 
     # START → Supervisor
     graph.add_edge(START, "run_supervisor")
 
-    # Supervisor → Index Repo → Planner → Coder
+    # Supervisor → Index Repo → Planner
     graph.add_edge("run_supervisor", "index_repo")
     graph.add_edge("index_repo", "run_planner")
-    graph.add_edge("run_planner", "run_coder")
 
-    # Coder → Reviewer (hybrid)
-    graph.add_edge("run_coder", "run_reviewer")
+    # Planner → conditional routing (guardrail check + normal flow)
+    graph.add_conditional_edges(
+        "run_planner",
+        route_after_planner,
+        {
+            "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "run_coder": "run_coder",
+        },
+    )
 
-    # Reviewer → conditional routing (hybrid: peer handoff on reject_with_changes)
+    # Coder → conditional routing (guardrail check + normal flow)
+    graph.add_conditional_edges(
+        "run_coder",
+        route_after_coder,
+        {
+            "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "run_reviewer": "run_reviewer",
+        },
+    )
+
+    # Reviewer → conditional routing (guardrail check + verdict routing)
     graph.add_conditional_edges(
         "run_reviewer",
         route_after_review_hybrid,
         {
+            "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "run_qa": "run_qa",  # accept → QA
             "run_peer_coder": "run_peer_coder",
             # reject_with_changes → peer Coder (VAL-TOPOLOGY-004)
@@ -722,26 +769,23 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
         },
     )
 
-    # ── Peer Coder → Reviewer (swarm loop) ────────────────────
-    # VAL-TOPOLOGY-005: This creates the Coder⇄Reviewer loop
-    # via peer handoff.  Each cycle, the Coder span's parent is
-    # the Reviewer span, and the Reviewer span's parent is the
-    # Supervisor span.
-    graph.add_edge("run_peer_coder", "run_reviewer")
+    # ── Peer Coder → conditional routing ────────────────────────
+    # VAL-TOPOLOGY-005: Coder⇄Reviewer loop via peer handoff
+    graph.add_conditional_edges(
+        "run_peer_coder",
+        route_after_peer_coder,
+        {
+            "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "run_reviewer": "run_reviewer",
+        },
+    )
 
-    # Wait — run_peer_coder should route to run_reviewer_hybrid,
-    # but both are the same Reviewer node.  Let me route to
-    # run_reviewer (which IS run_reviewer_hybrid in this graph).
-    # Actually, the graph's "run_reviewer" node IS run_reviewer_hybrid
-    # (we registered it above). So routing to "run_reviewer" from
-    # run_peer_coder will invoke run_reviewer_hybrid, which correctly
-    # handles the peer-loop case.
-
-    # QA → conditional routing (same as supervisor_only)
+    # QA → conditional routing (guardrail check + test results)
     graph.add_conditional_edges(
         "run_qa",
         route_after_qa_hybrid,
         {
+            "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "run_supervisor_finalize": "run_supervisor_finalize",
             "halt_test_failure": "halt_test_failure",
         },
@@ -761,6 +805,9 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
     # Halt nodes → END
     graph.add_edge("halt_retry_exhausted", END)
     graph.add_edge("halt_test_failure", END)
+
+    # Guardrail escalation → END (after HITL decision resolved)
+    graph.add_edge("hitl_guardrail_escalation", END)
 
     return graph
 

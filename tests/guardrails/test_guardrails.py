@@ -21,6 +21,7 @@ import pytest
 from src.guardrails.errors import GuardrailViolation
 from src.guardrails.middleware import GuardrailMiddleware
 from src.guardrails.rules import GuardrailRuleBase, get_all_rules
+from src.orchestrator import OrchestratorState
 from src.sandbox.config import SANDBOX_REPO_MOUNT_POINT
 
 # ── Fixtures ────────────────────────────────────────────────────────
@@ -672,3 +673,107 @@ class TestGuardrailMiddlewareIntegration:
         )
         assert result == "1 passed"
         mock_sandbox.run_tests.assert_called_once()
+
+
+# ── VAL-GUARDRAIL-009: Guardrail escalation HITL routing ───────────
+
+
+class TestGuardrailEscalationRouting:
+    """VAL-GUARDRAIL-009: Guardrail violations route to HITL escalation node.
+
+    When a guardrail violation fires, the orchestrator must:
+    1. Halt the agent (no further tool calls dispatched)
+    2. Route to the HITL guardrail escalation node
+    3. The escalation node fires interrupt() for human review
+
+    These tests verify the routing functions correctly detect
+    guardrail violations and route to the escalation node.
+    """
+
+    def test_route_after_planner_guardrail_block(self) -> None:
+        """route_after_planner routes to hitl_guardrail_escalation on guardrail_block."""
+        from src.orchestrator.supervisor_only import route_after_planner
+
+        state = OrchestratorState(outcome="guardrail_block")
+        result = route_after_planner(state)
+        assert result == "hitl_guardrail_escalation"
+
+    def test_route_after_planner_normal(self) -> None:
+        """route_after_planner routes to run_coder on normal outcome."""
+        from src.orchestrator.supervisor_only import route_after_planner
+
+        state = OrchestratorState(outcome="")
+        result = route_after_planner(state)
+        assert result == "run_coder"
+
+    def test_route_after_coder_guardrail_block(self) -> None:
+        """route_after_coder routes to hitl_guardrail_escalation on guardrail_block."""
+        from src.orchestrator.supervisor_only import route_after_coder
+
+        state = OrchestratorState(outcome="guardrail_block")
+        result = route_after_coder(state)
+        assert result == "hitl_guardrail_escalation"
+
+    def test_route_after_coder_normal(self) -> None:
+        """route_after_coder routes to run_reviewer on normal outcome."""
+        from src.orchestrator.supervisor_only import route_after_coder
+
+        state = OrchestratorState(outcome="")
+        result = route_after_coder(state)
+        assert result == "run_reviewer"
+
+    def test_route_after_review_guardrail_block(self) -> None:
+        """route_after_review routes to hitl_guardrail_escalation on guardrail_block."""
+        from src.orchestrator.supervisor_only import route_after_review
+
+        state = OrchestratorState(outcome="guardrail_block")
+        result = route_after_review(state)
+        assert result == "hitl_guardrail_escalation"
+
+    def test_route_after_qa_guardrail_block(self) -> None:
+        """route_after_qa routes to hitl_guardrail_escalation on guardrail_block."""
+        from src.orchestrator.supervisor_only import route_after_qa
+
+        state = OrchestratorState(outcome="guardrail_block")
+        result = route_after_qa(state)
+        assert result == "hitl_guardrail_escalation"
+
+    def test_route_after_review_hybrid_guardrail_block(self) -> None:
+        """route_after_review_hybrid routes to hitl_guardrail_escalation on guardrail_block."""
+        from src.orchestrator.hybrid import route_after_review_hybrid
+
+        state = OrchestratorState(outcome="guardrail_block")
+        result = route_after_review_hybrid(state)
+        assert result == "hitl_guardrail_escalation"
+
+    def test_route_after_qa_hybrid_guardrail_block(self) -> None:
+        """route_after_qa_hybrid routes to hitl_guardrail_escalation on guardrail_block."""
+        from src.orchestrator.hybrid import route_after_qa_hybrid
+
+        state = OrchestratorState(outcome="guardrail_block")
+        result = route_after_qa_hybrid(state)
+        assert result == "hitl_guardrail_escalation"
+
+    def test_route_after_peer_coder_guardrail_block(self) -> None:
+        """route_after_peer_coder routes to hitl_guardrail_escalation on guardrail_block."""
+        from src.orchestrator.hybrid import route_after_peer_coder
+
+        state = OrchestratorState(outcome="guardrail_block")
+        result = route_after_peer_coder(state)
+        assert result == "hitl_guardrail_escalation"
+
+    def test_graph_has_guardrail_escalation_node(self) -> None:
+        """supervisor_only graph has hitl_guardrail_escalation node."""
+        from src.orchestrator.supervisor_only import build_supervisor_only_graph
+
+        graph = build_supervisor_only_graph()
+        node_names = set(graph.nodes.keys())
+        assert "hitl_guardrail_escalation" in node_names
+
+    def test_hybrid_graph_has_guardrail_escalation_node(self) -> None:
+        """hybrid graph has hitl_guardrail_escalation node."""
+        from src.orchestrator.hybrid import build_hybrid_graph
+
+        graph = build_hybrid_graph()
+        node_names = set(graph.nodes.keys())
+        assert "hitl_guardrail_escalation" in node_names
