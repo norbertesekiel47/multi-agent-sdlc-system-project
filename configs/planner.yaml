@@ -1,0 +1,32 @@
+# Planner agent configuration
+agent:
+  name: planner
+  model_id: deepseek/deepseek-v4-pro
+  pydantic_ai_model: openrouter:deepseek/deepseek-v4-pro
+  output_type: ChangePlan
+  retries: 3
+  temperature: 0.2
+
+tools:
+  - rag_retrieval
+  - episodic_query
+
+input:
+  type: IssueContext
+  fields:
+    - repo_url
+    - issue_number
+    - issue_text
+    - repo_files
+    - repo_facts
+    - rag_hits
+    - episodic_facts
+    - recent_decisions
+
+output:
+  type: ChangePlan
+  fields:
+    - target_files
+    - rationale
+    - approach
+    - estimated_complexity

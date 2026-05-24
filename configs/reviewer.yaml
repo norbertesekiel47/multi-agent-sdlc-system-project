@@ -1,0 +1,26 @@
+# Reviewer agent configuration
+agent:
+  name: reviewer
+  model_id: deepseek/deepseek-chat-v3-0324
+  pydantic_ai_model: openrouter:deepseek/deepseek-chat-v3-0324
+  output_type: ReviewResult
+  retries: 3
+  temperature: 0.2
+  prompt_caching: true
+
+tools:
+  - sandbox_read_file
+  - run_static_analysis
+  - security_pattern_scan
+
+input:
+  type: CodeEdit
+  fields:
+    - diff
+    - touched_files
+
+output:
+  type: ReviewResult
+  fields:
+    - verdict
+    - issues

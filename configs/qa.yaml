@@ -1,0 +1,26 @@
+# QA agent configuration
+agent:
+  name: qa
+  model_id: deepseek/deepseek-chat-v3-0324
+  pydantic_ai_model: openrouter:deepseek/deepseek-chat-v3-0324
+  output_type: TestReport
+  retries: 3
+  temperature: 0.2
+
+tools:
+  - sandbox_write_file
+  - sandbox_run_tests
+
+input:
+  type: CodeEdit
+  fields:
+    - diff
+    - touched_files
+
+output:
+  type: TestReport
+  fields:
+    - passed
+    - failed
+    - failed_test_names
+    - generated_test_files

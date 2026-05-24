@@ -1,0 +1,30 @@
+# Coder agent configuration
+agent:
+  name: coder
+  model_id: deepseek/deepseek-chat-v3-0324
+  pydantic_ai_model: openrouter:deepseek/deepseek-chat-v3-0324
+  output_type: CodeEdit
+  retries: 3
+  temperature: 0.2
+  prompt_caching: true
+
+tools:
+  - sandbox_read_file
+  - sandbox_write_file
+  - sandbox_apply_diff
+  - rag_retrieval
+
+input:
+  type: ChangePlan
+  optional_input: ReviewResult
+  fields:
+    - target_files
+    - approach
+    - review_issues
+
+output:
+  type: CodeEdit
+  fields:
+    - diff
+    - touched_files
+    - diff_hash

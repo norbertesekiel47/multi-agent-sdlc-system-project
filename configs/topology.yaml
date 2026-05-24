@@ -1,0 +1,25 @@
+# Topology configuration
+topologies:
+  single_agent:
+    description: "One agent with all tools (baseline)"
+    agents: [single]
+    routing: linear
+    use_case: "Benchmark baseline"
+
+  supervisor_only:
+    description: "Supervisor routes between Planner, Coder, Reviewer, QA"
+    agents: [planner, coder, reviewer, qa, supervisor]
+    routing: sequential
+    use_case: "Mid baseline"
+
+  hybrid:
+    description: "Supervisor routes; Coder <-> Reviewer peer handoff via swarm"
+    agents: [planner, coder, reviewer, qa, supervisor]
+    routing: sequential_with_peer_handoff
+    peer_handoff:
+      - from: reviewer
+        to: coder
+        condition: verdict == "reject_with_changes"
+    use_case: "Default / production"
+
+default_topology: hybrid

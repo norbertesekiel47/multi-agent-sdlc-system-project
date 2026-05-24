@@ -1,0 +1,34 @@
+# Pinned model IDs for reproducible builds.
+# Each entry maps an agent role to the exact OpenRouter model ID
+# and the date the model was last verified.
+#
+# NOTE: deepseek-v4-flash is aspirational but unstable on OpenRouter
+# (intermittent 502 Bad Gateway). Using deepseek-chat-v3-0324 as
+# the stable fallback per AGENTS.md.
+
+models:
+  planner:
+    model_id: deepseek/deepseek-v4-pro
+    revision_date: "2026-05-23"
+    provider: openrouter
+
+  coder:
+    model_id: deepseek/deepseek-chat-v3-0324
+    revision_date: "2026-05-23"
+    provider: openrouter
+
+  reviewer:
+    model_id: deepseek/deepseek-chat-v3-0324
+    revision_date: "2026-05-23"
+    provider: openrouter
+
+  qa:
+    model_id: deepseek/deepseek-chat-v3-0324
+    revision_date: "2026-05-23"
+    provider: openrouter
+
+embeddings:
+  model_id: text-embedding-3-small
+  dimensions: 1536
+  provider: openai
+  revision_date: "2026-05-23"
