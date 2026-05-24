@@ -6,6 +6,8 @@ Free-form text outside the typed schema is rejected.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -141,15 +143,23 @@ class ReviewResult(BaseModel):
     """Typed output for review step.
 
     Verdict must be one of: accept, reject_with_changes, reject.
+    Using Literal enforces the enum at the Pydantic level so that
+    any out-of-enum value (e.g. "lgtm", "approved") fails validation
+    and counts toward the retry budget (VAL-REVIEWER-002).
     """
 
-    verdict: str = Field(
+    verdict: Literal["accept", "reject_with_changes", "reject"] = Field(
         ...,
         description="One of: accept, reject_with_changes, reject",
     )
     issues: list[str] = Field(
         default_factory=list,
         description="List of issues found during review",
+    )
+    diff_hash: str = Field(
+        default="",
+        description="SHA-256 hash of the CodeEdit diff being reviewed, "
+        "for same-fix rejection tracking",
     )
 
 
