@@ -862,3 +862,630 @@ class TestEndToEndPipeline:
         eval_result = evaluator.evaluate_patch_locally(instance, patch_str)
         assert eval_result.error is None
         assert eval_result.model_patch == patch_str
+
+
+# ════════════════════════════════════════════════════════════════════
+# VAL-SWE-BENCH-005 / 006 / 007 / 009 / 010 / 011
+# Aggregator: compute mean/variance/95% CI, persist results, Markdown
+# ════════════════════════════════════════════════════════════════════
+
+
+# ── VAL-SWE-BENCH-005: Parsed report validates as typed SweBenchResult ─
+
+
+class TestSweBenchResultParsing:
+    """Tests for SweBenchResult type validation (VAL-SWE-BENCH-005)."""
+
+    def test_passing_result_validates(self) -> None:
+        """SweBenchResult validates for a passing fixture report."""
+        result = SweBenchResult(
+            instance_id="django__django-16379",
+            resolved=True,
+            pass_count=3,
+            fail_count=0,
+            error=None,
+        )
+        assert result.resolved is True
+        assert result.pass_count == 3
+
+    def test_failing_result_validates(self) -> None:
+        """SweBenchResult validates for a failing fixture report."""
+        result = SweBenchResult(
+            instance_id="flask__flask-4817",
+            resolved=False,
+            pass_count=1,
+            fail_count=2,
+            error="2 tests failed",
+        )
+        assert result.resolved is False
+        assert result.fail_count == 2
+        assert result.error is not None
+
+    def test_model_validate_from_dict(self) -> None:
+        """SweBenchResult.model_validate parses a raw report dict."""
+        data = {
+            "instance_id": "django__django-12345",
+            "resolved": True,
+            "pass_count": 5,
+            "fail_count": 0,
+            "error": None,
+        }
+        result = SweBenchResult.model_validate(data)
+        assert result.instance_id == "django__django-12345"
+        assert result.resolved is True
+
+
+# ── VAL-SWE-BENCH-006: Aggregator computes stats with 95% CI per cell ─
+
+
+class TestAggregatorStatistics:
+    """Tests for aggregator statistics computation (VAL-SWE-BENCH-006)."""
+
+    def test_compute_statistics_known_values(self) -> None:
+        """Aggregator computes mean/variance/95% CI matching expected values.
+
+        Feed the aggregator a synthetic dataset where:
+        - topology='supervisor_only', model='deepseek/deepseek-chat-v3-0324'
+        - 3 instances, each with 3 runs (N=3)
+        - Instance results: [1, 1, 1], [0, 0, 0], [1, 0, 1]
+        - Expected per-cell mean = mean of per-instance means
+        """
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator()
+
+        # Synthetic per-instance run results
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                    {"resolved": True, "cost_caching_off_usd": 0.11, "cost_caching_on_usd": 0.07},
+                    {"resolved": True, "cost_caching_off_usd": 0.09, "cost_caching_on_usd": 0.05},
+                ],
+            },
+            {
+                "instance_id": "inst-2",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": False, "cost_caching_off_usd": 0.20, "cost_caching_on_usd": 0.12},
+                    {"resolved": False, "cost_caching_off_usd": 0.22, "cost_caching_on_usd": 0.13},
+                    {"resolved": False, "cost_caching_off_usd": 0.18, "cost_caching_on_usd": 0.11},
+                ],
+            },
+            {
+                "instance_id": "inst-3",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.15, "cost_caching_on_usd": 0.09},
+                    {"resolved": False, "cost_caching_off_usd": 0.16, "cost_caching_on_usd": 0.10},
+                    {"resolved": True, "cost_caching_off_usd": 0.14, "cost_caching_on_usd": 0.08},
+                ],
+            },
+        ]
+
+        cells = agg.compute_cells(instance_results)
+
+        # Should have 1 cell: (supervisor_only, deepseek/deepseek-chat-v3-0324)
+        assert len(cells) == 1
+        cell = cells[0]
+        assert cell["topology"] == "supervisor_only"
+        assert cell["model"] == "deepseek/deepseek-chat-v3-0324"
+
+        # Per-instance success rates: inst-1=1.0, inst-2=0.0, inst-3=0.667
+        # Mean of per-instance means = (1.0 + 0.0 + 0.667) / 3 ≈ 0.5556
+        expected_mean = (1.0 + 0.0 + 2.0 / 3.0) / 3.0
+        assert abs(cell["mean"] - expected_mean) < 1e-6
+
+        # Variance of per-instance means
+        per_instance_means = [1.0, 0.0, 2.0 / 3.0]
+        from statistics import variance as sample_variance
+        expected_var = sample_variance(per_instance_means)
+        assert abs(cell["variance"] - expected_var) < 1e-6
+
+        # 95% CI using normal approx: 1.96 * SE
+        import math
+        n = len(per_instance_means)
+        se = math.sqrt(expected_var / n)
+        expected_ci_low = expected_mean - 1.96 * se
+        expected_ci_high = expected_mean + 1.96 * se
+        assert abs(cell["ci_low"] - expected_ci_low) < 1e-6
+        assert abs(cell["ci_high"] - expected_ci_high) < 1e-6
+
+    def test_compute_statistics_single_instance(self) -> None:
+        """Aggregator handles a single instance (CI spans entire range)."""
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator()
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "single_agent",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                ],
+            },
+        ]
+
+        cells = agg.compute_cells(instance_results)
+        assert len(cells) == 1
+        cell = cells[0]
+        assert cell["mean"] == 1.0  # All resolved
+        assert cell["variance"] == 0.0  # No variation
+
+    def test_compute_statistics_multiple_topologies(self) -> None:
+        """Aggregator separates cells by (topology, model)."""
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator()
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "single_agent",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": False, "cost_caching_off_usd": 0.05, "cost_caching_on_usd": 0.03},
+                    {"resolved": False, "cost_caching_off_usd": 0.06, "cost_caching_on_usd": 0.04},
+                    {"resolved": False, "cost_caching_off_usd": 0.04, "cost_caching_on_usd": 0.02},
+                ],
+            },
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                    {"resolved": True, "cost_caching_off_usd": 0.11, "cost_caching_on_usd": 0.07},
+                    {"resolved": True, "cost_caching_off_usd": 0.09, "cost_caching_on_usd": 0.05},
+                ],
+            },
+        ]
+
+        cells = agg.compute_cells(instance_results)
+        assert len(cells) == 2
+        topologies = {c["topology"] for c in cells}
+        assert topologies == {"single_agent", "supervisor_only"}
+
+
+# ── VAL-SWE-BENCH-007: Aggregated results persisted to JSON ────────
+
+
+class TestAggregatorResultsJSON:
+    """Tests for aggregated results JSON persistence (VAL-SWE-BENCH-007)."""
+
+    def test_results_json_schema(self, tmp_path: Path) -> None:
+        """Aggregated results JSON matches documented schema."""
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                ],
+                "hitl_escalations": [],
+            },
+        ]
+
+        run_id = "test-run-001"
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=1,
+            runs_per_cell=1,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        # Verify the JSON file exists
+        results_path = tmp_path / f"{run_id}.json"
+        assert results_path.exists()
+
+        # Parse and validate the schema
+        import json
+        data = json.loads(results_path.read_text())
+
+        # Schema: {run_id, started_at, ended_at, slice_size, runs_per_cell, cells: [...]}
+        assert data["run_id"] == run_id
+        assert data["started_at"] == "2026-05-24T00:00:00Z"
+        assert data["ended_at"] == "2026-05-24T01:00:00Z"
+        assert data["slice_size"] == 1
+        assert data["runs_per_cell"] == 1
+        assert "cells" in data
+        assert isinstance(data["cells"], list)
+        assert len(data["cells"]) >= 1
+
+        # Verify cell structure
+        cell = data["cells"][0]
+        assert "topology" in cell
+        assert "model" in cell
+        assert "n" in cell
+        assert "mean" in cell
+        assert "variance" in cell
+        assert "ci_low" in cell
+        assert "ci_high" in cell
+        assert "instances" in cell
+
+    def test_results_json_run_id_matches(self, tmp_path: Path) -> None:
+        """Results JSON run_id matches the provided run UUID."""
+        import json
+
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+        run_id = "abc123def456"
+
+        instance_results: list[dict[str, object]] = []
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=0,
+            runs_per_cell=1,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        results_path = tmp_path / f"{run_id}.json"
+        data = json.loads(results_path.read_text())
+        assert data["run_id"] == run_id
+
+
+# ── VAL-SWE-BENCH-009: Aggregator emits Markdown report ────────────
+
+
+class TestAggregatorMarkdown:
+    """Tests for Markdown report generation (VAL-SWE-BENCH-009)."""
+
+    def test_markdown_report_exists(self, tmp_path: Path) -> None:
+        """Aggregator emits a Markdown report at benchmarks/results/<run-id>.md."""
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+        run_id = "md-test-001"
+
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                ],
+                "hitl_escalations": [],
+            },
+        ]
+
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=1,
+            runs_per_cell=1,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        md_path = tmp_path / f"{run_id}.md"
+        assert md_path.exists()
+
+    def test_markdown_report_header_columns(self, tmp_path: Path) -> None:
+        """Markdown report table header contains required columns.
+
+        Expected columns: topology | model | n | mean | variance | 95% CI
+        """
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+        run_id = "md-cols-001"
+
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                ],
+                "hitl_escalations": [],
+            },
+        ]
+
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=1,
+            runs_per_cell=1,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        md_path = tmp_path / f"{run_id}.md"
+        content = md_path.read_text()
+
+        # Check for required column headers (case-insensitive)
+        content_lower = content.lower()
+        for col in ["topology", "model", "n", "mean", "variance", "95% ci"]:
+            assert col in content_lower, f"Missing column header: {col}"
+
+    def test_markdown_report_has_data_rows(self, tmp_path: Path) -> None:
+        """Markdown report has at least 1 data row per cell."""
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+        run_id = "md-data-001"
+
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                ],
+                "hitl_escalations": [],
+            },
+        ]
+
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=1,
+            runs_per_cell=1,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        md_path = tmp_path / f"{run_id}.md"
+        content = md_path.read_text()
+
+        # The data row should contain the topology name
+        assert "supervisor_only" in content
+
+
+# ── VAL-SWE-BENCH-010: Separate cost columns for caching ON vs OFF ──
+
+
+class TestAggregatorCostColumns:
+    """Tests for separate cost columns: caching ON vs OFF (VAL-SWE-BENCH-010)."""
+
+    def test_results_json_has_both_cost_columns(self, tmp_path: Path) -> None:
+        """Results JSON contains both cost_caching_off_usd and cost_caching_on_usd per cell."""
+        import json
+
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+        run_id = "cost-test-001"
+
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                    {"resolved": True, "cost_caching_off_usd": 0.11, "cost_caching_on_usd": 0.07},
+                    {"resolved": True, "cost_caching_off_usd": 0.09, "cost_caching_on_usd": 0.05},
+                ],
+                "hitl_escalations": [],
+            },
+        ]
+
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=1,
+            runs_per_cell=3,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        results_path = tmp_path / f"{run_id}.json"
+        data = json.loads(results_path.read_text())
+
+        cell = data["cells"][0]
+        assert "cost_caching_off_usd" in cell
+        assert "cost_caching_on_usd" in cell
+        assert cell["cost_caching_off_usd"] is not None
+        assert cell["cost_caching_on_usd"] is not None
+
+        # cost_caching_on should be less than cost_caching_off
+        assert cell["cost_caching_on_usd"] < cell["cost_caching_off_usd"]
+
+    def test_markdown_has_both_cost_column_headers(self, tmp_path: Path) -> None:
+        """Markdown report header row contains both cost column names."""
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+        run_id = "cost-md-001"
+
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                ],
+                "hitl_escalations": [],
+            },
+        ]
+
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=1,
+            runs_per_cell=1,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        md_path = tmp_path / f"{run_id}.md"
+        content = md_path.read_text().lower()
+
+        assert "cost_caching_off_usd" in content
+        assert "cost_caching_on_usd" in content
+
+
+# ── VAL-SWE-BENCH-011: HITL escalations cause-tagged ───────────────
+
+
+class TestHITLEscalations:
+    """Tests for cause-tagged HITL escalations (VAL-SWE-BENCH-011)."""
+
+    def test_instance_results_include_hitl_escalations(self, tmp_path: Path) -> None:
+        """Per-instance results include hitl_escalations with cause values."""
+        import json
+
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+        run_id = "hitl-test-001"
+
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {
+                        "resolved": False,
+                        "cost_caching_off_usd": 0.10,
+                        "cost_caching_on_usd": 0.06,
+                    },
+                ],
+                "hitl_escalations": [
+                    {"cause": "loop_detected", "agent": "coder"},
+                ],
+            },
+        ]
+
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=1,
+            runs_per_cell=1,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        results_path = tmp_path / f"{run_id}.json"
+        data = json.loads(results_path.read_text())
+
+        # Find the instance in the cells
+        cell = data["cells"][0]
+        instance = cell["instances"][0]
+        assert "hitl_escalations" in instance
+        escalations = instance["hitl_escalations"]
+        assert len(escalations) >= 1
+        assert escalations[0]["cause"] == "loop_detected"
+        assert escalations[0]["agent"] == "coder"
+
+    def test_hitl_escalation_cause_values_match_outcomes_detail_trigger(self) -> None:
+        """HITL escalation cause values match outcomes.detail.trigger.
+
+        Valid causes: loop_detected, uncertainty_escalation,
+        retry_budget_exhausted, cost_budget_exhausted, guardrail_block, manual.
+        """
+        from src.benchmarks.swebench.aggregator import VALID_HITL_CAUSES
+
+        expected_causes = {
+            "loop_detected",
+            "uncertainty_escalation",
+            "retry_budget_exhausted",
+            "cost_budget_exhausted",
+            "guardrail_block",
+            "manual",
+        }
+        assert set(VALID_HITL_CAUSES) == expected_causes
+
+    def test_instance_without_escalations_has_empty_list(self, tmp_path: Path) -> None:
+        """Instance with no HITL escalations has an empty list."""
+        import json
+
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+        run_id = "hitl-empty-001"
+
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {"resolved": True, "cost_caching_off_usd": 0.10, "cost_caching_on_usd": 0.06},
+                ],
+                "hitl_escalations": [],
+            },
+        ]
+
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=1,
+            runs_per_cell=1,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        results_path = tmp_path / f"{run_id}.json"
+        data = json.loads(results_path.read_text())
+        cell = data["cells"][0]
+        instance = cell["instances"][0]
+        assert instance["hitl_escalations"] == []
+
+    def test_multiple_escalations_per_instance(self, tmp_path: Path) -> None:
+        """An instance can have multiple HITL escalations."""
+        import json
+
+        from src.benchmarks.swebench.aggregator import Aggregator
+
+        agg = Aggregator(output_dir=str(tmp_path))
+        run_id = "hitl-multi-001"
+
+        instance_results = [
+            {
+                "instance_id": "inst-1",
+                "topology": "supervisor_only",
+                "model": "deepseek/deepseek-chat-v3-0324",
+                "run_results": [
+                    {
+                        "resolved": False,
+                        "cost_caching_off_usd": 0.10,
+                        "cost_caching_on_usd": 0.06,
+                    },
+                ],
+                "hitl_escalations": [
+                    {"cause": "loop_detected", "agent": "coder"},
+                    {"cause": "retry_budget_exhausted", "agent": "reviewer"},
+                ],
+            },
+        ]
+
+        agg.aggregate_and_persist(
+            instance_results=instance_results,
+            run_id=run_id,
+            slice_size=1,
+            runs_per_cell=1,
+            started_at="2026-05-24T00:00:00Z",
+            ended_at="2026-05-24T01:00:00Z",
+        )
+
+        results_path = tmp_path / f"{run_id}.json"
+        data = json.loads(results_path.read_text())
+        cell = data["cells"][0]
+        instance = cell["instances"][0]
+        assert len(instance["hitl_escalations"]) == 2
+        causes = {e["cause"] for e in instance["hitl_escalations"]}
+        assert causes == {"loop_detected", "retry_budget_exhausted"}

@@ -15,11 +15,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 from datetime import UTC, datetime
-from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -72,6 +71,7 @@ def _parse_args() -> argparse.Namespace:
 
 async def _run_harness(args: argparse.Namespace) -> int:
     """Execute the SWE-bench harness with the given configuration."""
+    from src.benchmarks.swebench.aggregator import Aggregator
     from src.benchmarks.swebench.evaluator import SweBenchEvaluator
     from src.benchmarks.swebench.loader import InstanceLoader
     from src.benchmarks.swebench.models import RunConfig
@@ -113,14 +113,17 @@ async def _run_harness(args: argparse.Namespace) -> int:
 
     logger.info("Loaded %d instances", len(instances))
 
-    # Step 2: Run each instance
+    # Step 2: Run each instance and collect results for the aggregator
     runner = SweBenchRunner(config=config)
     evaluator = SweBenchEvaluator(
         output_dir=config.output_dir,
         timeout_seconds=1800,
     )
 
-    all_results: list[dict[str, object]] = []
+    # Collect results keyed by (instance_id, topology) for the aggregator
+    # Each instance gets a list of per-run results
+    instance_run_map: dict[str, dict[str, Any]] = {}
+
     run_start = datetime.now(UTC)
 
     for i, instance in enumerate(instances):
@@ -130,6 +133,16 @@ async def _run_harness(args: argparse.Namespace) -> int:
             len(instances),
             instance.instance_id,
         )
+
+        instance_key = instance.instance_id
+        if instance_key not in instance_run_map:
+            instance_run_map[instance_key] = {
+                "instance_id": instance.instance_id,
+                "topology": config.topology,
+                "model": "deepseek/deepseek-chat-v3-0324",  # Default model for benchmarking
+                "run_results": [],
+                "hitl_escalations": [],
+            }
 
         for run_idx in range(config.runs_per_cell):
             # Run the instance through the orchestrator
@@ -146,51 +159,61 @@ async def _run_harness(args: argparse.Namespace) -> int:
                 run_id=run_id,
             )
 
-            # Combine results
-            combined = {
-                "instance_id": instance.instance_id,
-                "run_index": run_idx,
-                "run_status": run_result.get("status", "unknown"),
-                "run_error": run_result.get("error"),
-                "cost_usd": run_result.get("cost_usd", 0.0),
-                "duration_seconds": run_result.get("duration_seconds", 0.0),
-                "eval_resolved": eval_result.resolved,
-                "eval_pass_count": eval_result.pass_count,
-                "eval_fail_count": eval_result.fail_count,
-                "eval_error": eval_result.error,
-                "patch": patch,
-            }
-            all_results.append(combined)
+            # Compute cost with and without caching
+            # The runner returns cost_usd which reflects actual cost (with caching if applied)
+            # cost_caching_off_usd estimates what the cost would be without cached tokens
+            cost_usd = float(run_result.get("cost_usd", 0.0))
+
+            # Estimate cost_caching_off: if caching is active, actual cost reflects
+            # the discount. We estimate the "without caching" cost as the raw
+            # token cost based on prompt + completion tokens.
+            # For simplicity, we record both values from the run result;
+            # if not provided, cost_caching_off = cost_usd (no caching discount observed).
+            cost_caching_off_usd = float(run_result.get("cost_caching_off_usd", cost_usd))
+            cost_caching_on_usd = float(run_result.get("cost_caching_on_usd", cost_usd))
+
+            # Collect HITL escalations from outcomes
+            # In production, these come from the episodic store outcomes table.
+            # The runner may include escalation info in the run result.
+            hitl_escalations = run_result.get("hitl_escalations", [])
+            if isinstance(hitl_escalations, list):
+                instance_run_map[instance_key]["hitl_escalations"].extend(hitl_escalations)
+
+            # Append the per-run result
+            instance_run_map[instance_key]["run_results"].append({
+                "resolved": eval_result.resolved,
+                "cost_caching_off_usd": cost_caching_off_usd,
+                "cost_caching_on_usd": cost_caching_on_usd,
+                "pass_count": eval_result.pass_count,
+                "fail_count": eval_result.fail_count,
+                "error": eval_result.error,
+            })
 
     run_end = datetime.now(UTC)
 
-    # Step 3: Write results
-    output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Step 3: Aggregate results and persist
+    instance_results = list(instance_run_map.values())
+    aggregator = Aggregator(output_dir=config.output_dir)
 
-    results_json = {
-        "run_id": run_id,
-        "started_at": run_start.isoformat(),
-        "ended_at": run_end.isoformat(),
-        "slice_size": config.slice_size,
-        "runs_per_cell": config.runs_per_cell,
-        "topology": config.topology,
-        "temperature": config.temperature,
-        "instances": all_results,
-    }
-
-    results_path = output_dir / f"{run_id}.json"
-    results_path.write_text(json.dumps(results_json, indent=2, default=str))
-    logger.info("Results written to %s", results_path)
+    aggregator.aggregate_and_persist(
+        instance_results=instance_results,
+        run_id=run_id,
+        slice_size=config.slice_size,
+        runs_per_cell=config.runs_per_cell,
+        started_at=run_start.isoformat(),
+        ended_at=run_end.isoformat(),
+    )
 
     # Summary
-    total = len(all_results)
-    resolved = sum(1 for r in all_results if r.get("eval_resolved"))
+    total_runs = sum(len(ir["run_results"]) for ir in instance_results)
+    total_resolved = sum(
+        1 for ir in instance_results for r in ir["run_results"] if r.get("resolved")
+    )
     logger.info(
         "Harness complete: %d/%d resolved (%.1f%%)",
-        resolved,
-        total,
-        100.0 * resolved / total if total > 0 else 0.0,
+        total_resolved,
+        total_runs,
+        100.0 * total_resolved / total_runs if total_runs > 0 else 0.0,
     )
 
     return 0
