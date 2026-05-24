@@ -227,6 +227,7 @@ class EpisodicStore:
         repo_url: str | None = None,
         status: str | None = None,
         outcome: str | None = None,
+        topology: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[TaskRow]:
@@ -244,6 +245,11 @@ class EpisodicStore:
         if status is not None:
             conditions.append(f"status = ${idx}")
             args.append(status)
+            idx += 1
+
+        if topology is not None:
+            conditions.append(f"topology = ${idx}")
+            args.append(topology)
             idx += 1
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
