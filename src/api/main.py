@@ -112,6 +112,32 @@ async def _shutdown_store() -> None:
         _store = None
 
 
+# ── Background orchestrator ─────────────────────────────────────────
+
+
+def _start_orchestrator_background(task_id: str, store: EpisodicStore) -> None:
+    """Start the orchestrator for a task in a background asyncio task.
+
+    This is fire-and-forget — errors are logged but don't affect the
+    POST /tasks response.
+    """
+
+    async def _run() -> None:
+        from src.orchestrator import Orchestrator
+
+        try:
+            orchestrator = Orchestrator(store=store)
+            await orchestrator.run_task(task_id=task_id)
+        except Exception:
+            logger.exception("Background orchestrator failed for task %s", task_id)
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_run())
+    except RuntimeError:
+        logger.warning("No running event loop; cannot start orchestrator for task %s", task_id)
+
+
 # ── GET /health ──────────────────────────────────────────────────────
 
 
@@ -189,6 +215,8 @@ async def create_task(
 
     Validates topology, repo URL, and issue number.
     Creates the row in Postgres via the EpisodicStore.
+    If ``auto_start`` is True (default), also kicks off the
+    orchestrator in the background.
     """
     params = CreateTaskParams(
         repo_url=body.repo_url,
@@ -202,6 +230,11 @@ async def create_task(
         "Created task %s (repo=%s, issue=%d, topology=%s)",
         task.id, task.repo_url, task.issue_number, task.topology,
     )
+
+    # Auto-start the orchestrator in the background
+    if body.auto_start:
+        _start_orchestrator_background(str(task.id), store)
+
     return CreateTaskResponse(id=task.id)
 
 

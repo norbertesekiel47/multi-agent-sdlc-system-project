@@ -33,6 +33,7 @@ class CreateTaskRequest(BaseModel):
     issue_number: int = Field(..., gt=0, le=2147483647, description="GitHub issue number")
     issue_text: str = Field(..., min_length=1, description="Issue text / description")
     topology: str = Field(default="hybrid", description="Agent topology")
+    auto_start: bool = Field(default=True, description="Start the orchestrator automatically")
 
     @field_validator("repo_url")
     @classmethod
