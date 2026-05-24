@@ -223,8 +223,8 @@ class SweBenchRunner:
 
         # Now invoke the orchestrator with the instance's repo URL and issue text.
         # The orchestrator handles: clone, sandbox, agents, patch generation.
-        # We use the existing orchestrator flow (supervisor_only by default)
-        # and capture the resulting diff.
+        # The per-instance Docker image is passed so the sandbox uses the
+        # correct SWE-bench environment instead of the default sandbox base.
         container_id: str | None = None
 
         try:
@@ -237,6 +237,7 @@ class SweBenchRunner:
                 instance=instance,
                 repo_url=repo_url,
                 task_id=task_id,
+                image_name=image_name,
             )
 
             duration = time.monotonic() - start_time
@@ -279,21 +280,35 @@ class SweBenchRunner:
         instance: SweBenchInstance,
         repo_url: str,
         task_id: str,
+        *,
+        image_name: str,
     ) -> tuple[str, float]:
         """Invoke the orchestrator with the instance's repo URL and issue text.
 
-        Uses the existing supervisor_only topology to produce a patch.
-        The orchestrator handles cloning, sandbox provisioning, agent
-        execution, and diff generation.
+        Selects the appropriate graph builder based on ``self.config.topology``
+        (no longer hardcoded to supervisor_only).  Passes the SWE-bench
+        per-instance Docker image to SandboxManager so the sandbox uses the
+        correct environment instead of the default sandbox-base image.
+
+        Args:
+            instance: The SWE-bench instance.
+            repo_url: Full HTTPS URL of the target repo.
+            task_id: Short hex identifier for this run.
+            image_name: SWE-bench Docker image to use for the sandbox
+                (e.g. ``swebench/sweb.eval.x86_64.django_django-12345:latest``).
 
         Returns:
             Tuple of (patch_string, cost_usd).
+
+        Raises:
+            NotImplementedError: If the topology is ``hybrid`` (M4).
+            ValueError: If the topology is unknown.
         """
         from langgraph.types import RunnableConfig  # type: ignore[attr-defined]
 
         from src.memory.episodic.store import EpisodicStore
         from src.memory.semantic.store import SemanticStore
-        from src.orchestrator import OrchestratorState
+        from src.orchestrator import OrchestratorState, build_single_agent_graph
         from src.orchestrator.supervisor_only import (
             build_supervisor_only_graph,
             register_sandbox,
@@ -305,6 +320,21 @@ class SweBenchRunner:
         )
         from src.sandbox.manager import SandboxManager
 
+        # ── Topology routing ───────────────────────────────────────
+        if self.config.topology == "supervisor_only":
+            build_graph = build_supervisor_only_graph
+        elif self.config.topology == "single_agent":
+            build_graph = build_single_agent_graph
+        elif self.config.topology == "hybrid":
+            msg = (
+                "Hybrid topology is not yet implemented — "
+                "requires Coder⇄Reviewer peer handoff (M4)."
+            )
+            raise NotImplementedError(msg)
+        else:
+            msg = f"Unknown topology: {self.config.topology!r}"
+            raise ValueError(msg)
+
         # Create stores (DSN built from env vars by default)
         episodic_store = EpisodicStore()
         semantic_store = SemanticStore()
@@ -313,8 +343,9 @@ class SweBenchRunner:
         register_store(task_id, episodic_store)
         register_semantic_store(task_id, semantic_store)
 
-        # Create and register sandbox
-        sandbox = SandboxManager(task_id=task_id)
+        # Create sandbox with the SWE-bench per-instance Docker image
+        # (Fix 1: was hardcoded to default sandbox-base; now uses image_name)
+        sandbox = SandboxManager(task_id=task_id, image=image_name)
         register_sandbox(task_id, sandbox)
 
         try:
@@ -349,8 +380,8 @@ class SweBenchRunner:
             os.environ["LLM_TEMPERATURE"] = str(self.config.temperature)
 
             try:
-                # Build and run the graph
-                graph = build_supervisor_only_graph()
+                # Build and run the graph (Fix 2: topology-dependent builder)
+                graph = build_graph()
                 compiled = graph.compile()
                 config_dict: RunnableConfig = {"configurable": {"thread_id": task_id}}
 

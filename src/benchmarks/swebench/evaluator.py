@@ -162,13 +162,20 @@ class SweBenchEvaluator:
             # We need to set up the call properly
             logger.info("Invoking swebench evaluator for instance %s", instance_id)
 
+            # Write swe_bench_tasks to a temp JSON file instead of passing
+            # the raw JSON string on the command line.  Raw JSON on the CLI
+            # is fragile (shell escaping, arg-length limits) and the
+            # swebench harness accepts a file path for --swe_bench_tasks.
+            tasks_file = output_dir / "swe_bench_tasks.json"
+            tasks_file.write_text(json.dumps(swe_bench_tasks))
+
             # Build command-line arguments for swebench
             args = [
                 "--instance_ids", instance_id,
                 "--max_workers", "1",
                 "--run_id", run_id or "sdlc-swarm",
                 "--predictions_path", predictions_file,
-                "--swe_bench_tasks", json.dumps(swe_bench_tasks),
+                "--swe_bench_tasks", str(tasks_file),
                 "--output_dir", str(output_dir),
             ]
 
