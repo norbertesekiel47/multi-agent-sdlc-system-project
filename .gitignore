@@ -47,3 +47,6 @@ mission-artifacts/runs/
 mission-artifacts/**/runs/
 swebench-cache/
 benchmarks/results/
+
+# ── Promptfoo eval output ──
+.promptfoo/

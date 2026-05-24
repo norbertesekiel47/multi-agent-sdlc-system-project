@@ -1,0 +1,60 @@
+name: Promptfoo Eval
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Run on changes to agent prompts or eval config
+      - 'src/agents/**'
+      - 'evals/**'
+      - '.github/workflows/promptfoo-eval.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/agents/**'
+      - 'evals/**'
+      - '.github/workflows/promptfoo-eval.yml'
+
+jobs:
+  promptfoo-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install fnm
+        uses: Schniz/fnm-action@v2
+        with:
+          node-version: 22
+
+      - name: Setup Node 22 via fnm
+        run: |
+          eval "$(fnm env)"
+          fnm use 22
+          node --version
+          npm --version
+
+      - name: Install promptfoo
+        run: |
+          eval "$(fnm env)"
+          fnm use 22
+          npm install -g promptfoo
+          promptfoo --version
+
+      - name: Run promptfoo eval
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          eval "$(fnm env)"
+          fnm use 22
+          promptfoo eval --config evals/promptfooconfig.yaml --no-cache
+
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: promptfoo-eval-results
+          path: .promptfoo/output/
+          retention-days: 14

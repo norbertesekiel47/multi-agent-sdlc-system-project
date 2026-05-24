@@ -1,0 +1,408 @@
+# SDLC-Swarm Promptfoo Eval Configuration
+#
+# Regression assertions on the custom curated repo's known-good outcomes.
+# Tests that agent prompts produce structurally correct outputs for
+# the sdlc-swarm-curated repository issues.
+#
+# Planner uses deepseek-v4-pro; Coder/Reviewer/QA use deepseek-chat-v3-0324.
+# Each test case has its own inline prompt + provider specification.
+#
+# Run: eval "$(fnm env)" && fnm use 22 && npx promptfoo eval --config evals/promptfooconfig.yaml
+# CI: .github/workflows/promptfoo-eval.yml
+
+description: "SDLC-Swarm agent prompt regression tests on curated repo"
+
+tags:
+  repo: norbertesekiel47/sdlc-swarm-curated
+  purpose: regression
+
+providers:
+  - id: openrouter:deepseek/deepseek-v4-pro
+    config:
+      temperature: 0.2
+  - id: openrouter:deepseek/deepseek-chat-v3-0324
+    config:
+      temperature: 0.2
+
+# Placeholder — each test overrides prompt and provider
+prompts: ["{{prompt}}"]
+
+tests:
+  # ═══════════════════════════════════════════════════════════════
+  # Planner Tests — deepseek/deepseek-v4-pro
+  # ═══════════════════════════════════════════════════════════════
+
+  - description: "Planner: issue #1 subtract bug → target_files includes calculator.py"
+    provider: openrouter:deepseek/deepseek-v4-pro
+    vars:
+      prompt: |
+        You are the Planner agent in an autonomous multi-agent SDLC system.
+        Your job is to analyze a GitHub issue and produce a structured change plan.
+
+        You MUST produce a ChangePlan with:
+        1. target_files: List of file paths that need to be modified (at least 1)
+        2. rationale: A detailed explanation of WHY these changes are needed
+        3. approach: A high-level strategy for implementing the changes
+        4. estimated_complexity: "low", "medium", or "high"
+
+        RULES:
+        - Your output MUST be a valid ChangePlan.
+        - The target_files list must only include files that actually need modification.
+
+        ## Issue (#1) — https://github.com/norbertesekiel47/sdlc-swarm-curated
+        Bug: subtract() returns wrong result
+        The subtract function in src/calculator.py returns a + b instead of a - b.
+        subtract(5, 3) returns 8 instead of 2.
+
+        **src/calculator.py:**
+        ```python
+        def subtract(a: int, b: int) -> int:
+            """Subtract b from a."""
+            return a + b  # BUG: should be a - b
+        ```
+
+        Produce a ChangePlan.
+    assert:
+      - type: contains
+        value: "calculator"
+      - type: regex
+        value: "target_files"
+      - type: not-contains
+        value: "string_utils"
+
+  - description: "Planner: issue #2 divide crash → target_files includes calculator.py"
+    provider: openrouter:deepseek/deepseek-v4-pro
+    vars:
+      prompt: |
+        You are the Planner agent in an autonomous multi-agent SDLC system.
+        Your job is to analyze a GitHub issue and produce a structured change plan.
+
+        You MUST produce a ChangePlan with:
+        1. target_files: List of file paths that need to be modified (at least 1)
+        2. rationale: A detailed explanation of WHY these changes are needed
+        3. approach: A high-level strategy for implementing the changes
+        4. estimated_complexity: "low", "medium", or "high"
+
+        RULES:
+        - Your output MUST be a valid ChangePlan.
+        - The target_files list must only include files that actually need modification.
+
+        ## Issue (#2) — https://github.com/norbertesekiel47/sdlc-swarm-curated
+        Bug: divide() crashes on division by zero
+        The divide function in src/calculator.py does not check for zero divisor.
+        divide(5, 0) raises ZeroDivisionError.
+
+        **src/calculator.py:**
+        ```python
+        def divide(a: int, b: int) -> float:
+            """Divide a by b."""
+            return a / b  # BUG: no zero check
+        ```
+
+        Produce a ChangePlan.
+    assert:
+      - type: contains
+        value: "calculator"
+      - type: regex
+        value: "target_files"
+      - type: not-contains
+        value: "string_utils"
+
+  - description: "Planner: issue #5 absolute_value bug → target_files includes calculator.py"
+    provider: openrouter:deepseek/deepseek-v4-pro
+    vars:
+      prompt: |
+        You are the Planner agent in an autonomous multi-agent SDLC system.
+        Your job is to analyze a GitHub issue and produce a structured change plan.
+
+        You MUST produce a ChangePlan with:
+        1. target_files: List of file paths that need to be modified (at least 1)
+        2. rationale: A detailed explanation of WHY these changes are needed
+        3. approach: A high-level strategy for implementing the changes
+        4. estimated_complexity: "low", "medium", or "high"
+
+        RULES:
+        - Your output MUST be a valid ChangePlan.
+        - The target_files list must only include files that actually need modification.
+
+        ## Issue (#5) — https://github.com/norbertesekiel47/sdlc-swarm-curated
+        Bug: absolute_value() returns wrong result for negatives
+        The absolute_value function in src/calculator.py returns n instead of -n when negative.
+        absolute_value(-5) returns -5 instead of 5.
+
+        **src/calculator.py:**
+        ```python
+        def absolute_value(n: int) -> int:
+            """Return the absolute value of n."""
+            if n < 0:
+                return n  # BUG: should return -n
+            return n
+        ```
+
+        Produce a ChangePlan.
+    assert:
+      - type: contains
+        value: "calculator"
+      - type: regex
+        value: "target_files"
+
+  - description: "Planner: issue #6 is_anagram spaces → target_files includes string_utils.py"
+    provider: openrouter:deepseek/deepseek-v4-pro
+    vars:
+      prompt: |
+        You are the Planner agent in an autonomous multi-agent SDLC system.
+        Your job is to analyze a GitHub issue and produce a structured change plan.
+
+        You MUST produce a ChangePlan with:
+        1. target_files: List of file paths that need to be modified (at least 1)
+        2. rationale: A detailed explanation of WHY these changes are needed
+        3. approach: A high-level strategy for implementing the changes
+        4. estimated_complexity: "low", "medium", or "high"
+
+        RULES:
+        - Your output MUST be a valid ChangePlan.
+        - The target_files list must only include files that actually need modification.
+
+        ## Issue (#6) — https://github.com/norbertesekiel47/sdlc-swarm-curated
+        Bug: is_anagram() fails when strings contain spaces
+        The is_anagram function in src/string_utils.py does not strip spaces before comparing.
+        is_anagram("dormitory", "dirty room") fails.
+
+        **src/string_utils.py:**
+        ```python
+        def is_anagram(s1: str, s2: str) -> bool:
+            """Check if two strings are anagrams."""
+            return sorted(s1.lower()) == sorted(s2.lower())  # BUG: doesn't strip spaces
+        ```
+
+        Produce a ChangePlan.
+    assert:
+      - type: contains
+        value: "string_utils"
+      - type: regex
+        value: "target_files"
+      - type: not-contains
+        value: "calculator"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Coder Tests — deepseek/deepseek-chat-v3-0324
+  # ═══════════════════════════════════════════════════════════════
+
+  - description: "Coder: subtract fix → diff contains a - b"
+    provider: openrouter:deepseek/deepseek-chat-v3-0324
+    vars:
+      prompt: |
+        You are the Coder agent in an autonomous multi-agent SDLC system.
+        Your job is to produce a code edit that fixes a GitHub issue.
+
+        You MUST produce a CodeEdit with:
+        1. diff: A unified diff string
+        2. touched_files: List of file paths modified by this diff
+
+        RULES:
+        - Your output MUST be a valid CodeEdit.
+        - The diff must be a valid unified diff format.
+
+        ## Change Plan
+        Target files: ["src/calculator.py"]
+        Rationale: The subtract function uses addition instead of subtraction.
+        Approach: Change `return a + b` to `return a - b` in the subtract function.
+
+        **src/calculator.py:**
+        ```python
+        def subtract(a: int, b: int) -> int:
+            """Subtract b from a."""
+            return a + b  # BUG: should be a - b
+        ```
+
+        Produce a CodeEdit with a unified diff.
+    assert:
+      - type: contains
+        value: "a - b"
+      - type: regex
+        value: "touched_files"
+      - type: contains
+        value: "calculator"
+
+  - description: "Coder: divide zero check → diff adds zero check"
+    provider: openrouter:deepseek/deepseek-chat-v3-0324
+    vars:
+      prompt: |
+        You are the Coder agent in an autonomous multi-agent SDLC system.
+        Your job is to produce a code edit that fixes a GitHub issue.
+
+        You MUST produce a CodeEdit with:
+        1. diff: A unified diff string
+        2. touched_files: List of file paths modified by this diff
+
+        RULES:
+        - Your output MUST be a valid CodeEdit.
+        - The diff must be a valid unified diff format.
+
+        ## Change Plan
+        Target files: ["src/calculator.py"]
+        Rationale: The divide function crashes on division by zero.
+        Approach: Add a zero check before division and raise ValueError.
+
+        **src/calculator.py:**
+        ```python
+        def divide(a: int, b: int) -> float:
+            """Divide a by b."""
+            return a / b  # BUG: no zero check
+        ```
+
+        Produce a CodeEdit with a unified diff.
+    assert:
+      - type: regex
+        value: "(zero|ZeroDivision|b == 0|!= 0|if not b)"
+      - type: contains
+        value: "calculator"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Reviewer Tests — deepseek/deepseek-chat-v3-0324
+  # ═══════════════════════════════════════════════════════════════
+
+  - description: "Reviewer: correct subtract fix → verdict accept"
+    provider: openrouter:deepseek/deepseek-chat-v3-0324
+    vars:
+      prompt: |
+        You are the Reviewer agent in an autonomous multi-agent SDLC system.
+        Your job is to review a code edit and produce a structured review result.
+
+        You MUST produce a ReviewResult with:
+        1. verdict: One of exactly three values: "accept", "reject_with_changes", "reject"
+        2. issues: A list of specific problems found (empty for accept)
+
+        RULES:
+        - The verdict MUST be exactly one of: accept, reject_with_changes, reject.
+
+        ## Code Edit to Review
+        Touched files: ["src/calculator.py"]
+        Diff:
+        ```diff
+        --- a/src/calculator.py
+        +++ b/src/calculator.py
+        @@ -5,7 +5,7 @@
+         def subtract(a: int, b: int) -> int:
+             """Subtract b from a."""
+        -    return a + b  # BUG: should be a - b
+        +    return a - b
+        ```
+
+        This is a straightforward fix: changing `a + b` to `a - b`.
+        Produce a ReviewResult.
+    assert:
+      - type: contains
+        value: "accept"
+      - type: not-contains
+        value: "reject"
+
+  - description: "Reviewer: incorrect fix → verdict reject"
+    provider: openrouter:deepseek/deepseek-chat-v3-0324
+    vars:
+      prompt: |
+        You are the Reviewer agent in an autonomous multi-agent SDLC system.
+        Your job is to review a code edit and produce a structured review result.
+
+        You MUST produce a ReviewResult with:
+        1. verdict: One of exactly three values: "accept", "reject_with_changes", "reject"
+        2. issues: A list of specific problems found (empty for accept)
+
+        RULES:
+        - The verdict MUST be exactly one of: accept, reject_with_changes, reject.
+
+        ## Code Edit to Review
+        Touched files: ["src/calculator.py"]
+        Diff:
+        ```diff
+        --- a/src/calculator.py
+        +++ b/src/calculator.py
+        @@ -5,7 +5,7 @@
+         def subtract(a: int, b: int) -> int:
+             """Subtract b from a."""
+        -    return a + b  # BUG: should be a - b
+        +    return b - a
+        ```
+
+        This fix swaps the operands (b - a instead of a - b), which is incorrect.
+        Produce a ReviewResult.
+    assert:
+      - type: regex
+        value: "(reject_with_changes|reject)"
+      - type: contains
+        value: "verdict"
+
+  # ═══════════════════════════════════════════════════════════════
+  # QA Tests — deepseek/deepseek-chat-v3-0324
+  # ═══════════════════════════════════════════════════════════════
+
+  - description: "QA: correct subtract fix → tests pass"
+    provider: openrouter:deepseek/deepseek-chat-v3-0324
+    vars:
+      prompt: |
+        You are the QA agent in an autonomous multi-agent SDLC system.
+        Your job is to produce a test report for a code edit.
+
+        You MUST produce a TestReport with:
+        1. passed: Number of passing tests
+        2. failed: Number of failing tests
+        3. failed_test_names: List of names of failing tests
+
+        RULES:
+        - Your output MUST be a valid TestReport.
+
+        ## Code Edit Applied
+        The subtract function was fixed: `return a + b` changed to `return a - b`.
+        Touched file: src/calculator.py
+
+        ## Test Results
+        test_calculator.py::test_subtract PASSED
+        test_calculator.py::test_add PASSED
+        test_calculator.py::test_multiply PASSED
+        test_calculator.py::test_divide PASSED
+        4 passed, 0 failed
+
+        Produce a TestReport.
+    assert:
+      - type: contains
+        value: "passed"
+      - type: regex
+        value: "(failed.*0|0.*failed)"
+      - type: not-contains
+        value: "reject"
+
+  - description: "QA: fix introduces test failures → failed count > 0"
+    provider: openrouter:deepseek/deepseek-chat-v3-0324
+    vars:
+      prompt: |
+        You are the QA agent in an autonomous multi-agent SDLC system.
+        Your job is to produce a test report for a code edit.
+
+        You MUST produce a TestReport with:
+        1. passed: Number of passing tests
+        2. failed: Number of failing tests
+        3. failed_test_names: List of names of failing tests
+
+        RULES:
+        - Your output MUST be a valid TestReport.
+
+        ## Code Edit Applied
+        The subtract function was "fixed" but introduced a regression: `return b - a`.
+        Touched file: src/calculator.py
+
+        ## Test Results
+        test_calculator.py::test_subtract FAILED
+        test_calculator.py::test_add PASSED
+        test_calculator.py::test_multiply PASSED
+        test_calculator.py::test_divide PASSED
+        3 passed, 1 failed
+        Failed: test_subtract (assert 2 == -2)
+
+        Produce a TestReport.
+    assert:
+      - type: regex
+        value: "failed"
+      - type: regex
+        value: "test_subtract"
+      - type: contains
+        value: "failed_test_names"
