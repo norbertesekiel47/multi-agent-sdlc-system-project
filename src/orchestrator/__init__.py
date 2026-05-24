@@ -100,6 +100,14 @@ class OrchestratorState(BaseModel):
     # HITL decision tracking (M4)
     hitl_decision: str = ""
 
+    # Peer-handoff tracking (hybrid topology — M4)
+    # Counts the number of Coder⇄Reviewer peer handoffs
+    # (reject_with_changes loops via swarm edge, not through Supervisor)
+    peer_handoff_count: int = 0
+    # The span ID of the most recent Reviewer span, used as
+    # the parent for the next peer-handoff Coder span
+    last_reviewer_span_id: str = ""
+
     # Result
     pr_url: str = ""
     outcome: str = ""
@@ -467,18 +475,29 @@ class Orchestrator:
             status="running",
         )
 
-        # For supervisor_only, provision sandbox + clone before the graph
+        # For supervisor_only and hybrid, provision sandbox + clone before the graph
         sandbox: SandboxManager | None = None
-        if task.topology == "supervisor_only":
-            from src.orchestrator.supervisor_only import (
-                build_supervisor_only_graph,
-                register_sandbox,
-                register_semantic_store,
-                register_store,
-                unregister_sandbox,
-                unregister_semantic_store,
-                unregister_store,
-            )
+        if task.topology in ("supervisor_only", "hybrid"):
+            if task.topology == "supervisor_only":
+                from src.orchestrator.supervisor_only import (
+                    build_supervisor_only_graph,
+                    register_sandbox,
+                    register_semantic_store,
+                    register_store,
+                    unregister_sandbox,
+                    unregister_semantic_store,
+                    unregister_store,
+                )
+            else:
+                from src.orchestrator.hybrid import (
+                    build_hybrid_graph,
+                    register_sandbox,
+                    register_semantic_store,
+                    register_store,
+                    unregister_sandbox,
+                    unregister_semantic_store,
+                    unregister_store,
+                )
 
             sandbox = SandboxManager(task_id=task_id)
             try:
@@ -514,13 +533,16 @@ class Orchestrator:
             await semantic_store.connect()
             register_semantic_store(task_id, semantic_store)
 
-            graph = build_supervisor_only_graph()
+            if task.topology == "supervisor_only":
+                graph = build_supervisor_only_graph()
+            else:
+                graph = build_hybrid_graph()
         elif task.topology == "single_agent":
             graph = build_single_agent_graph()
         else:
             msg = (
                 f"Topology {task.topology!r} not yet implemented "
-                "(M1 only supports single_agent, M2 adds supervisor_only)"
+                "(supported: single_agent, supervisor_only, hybrid)"
             )
             raise ValueError(msg)
 
