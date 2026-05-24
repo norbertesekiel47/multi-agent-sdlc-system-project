@@ -559,8 +559,12 @@ class TestSupervisorOnlyGraphExecution:
             for p in self._mock_infrastructure():
                 stack.enter_context(p)
 
+            # Compile with checkpointer so HITL interrupt() works
+            from langgraph.checkpoint.memory import MemorySaver
+
             graph = build_supervisor_only_graph()
-            compiled = graph.compile()
+            checkpointer = MemorySaver()
+            compiled = graph.compile(checkpointer=checkpointer)
 
             state = OrchestratorState(
                 task_id=str(uuid4()),
@@ -570,8 +574,20 @@ class TestSupervisorOnlyGraphExecution:
                 topology="supervisor_only",
             )
 
-            result = await compiled.ainvoke(state)
-            final = OrchestratorState.model_validate(result)
+            # Run the graph — it will pause at the HITL interrupt
+            config = {"configurable": {"thread_id": f"test-accept-{uuid4()}"}}
+            result = await compiled.ainvoke(state, config=config)
+
+            # Graph should have hit the HITL interrupt
+            assert "__interrupt__" in result
+
+            # Resume with approve to complete the task
+            from langgraph.types import Command
+
+            result2 = await compiled.ainvoke(
+                Command(resume="approve"), config=config
+            )
+            final = OrchestratorState.model_validate(result2)
 
             assert final.status == "completed"
             assert final.outcome in ("pr_opened", "success")
@@ -672,8 +688,12 @@ class TestSupervisorOnlyGraphExecution:
             for p in self._mock_infrastructure():
                 stack.enter_context(p)
 
+            # Compile with checkpointer so HITL interrupt() works
+            from langgraph.checkpoint.memory import MemorySaver
+
             graph = build_supervisor_only_graph()
-            compiled = graph.compile()
+            checkpointer = MemorySaver()
+            compiled = graph.compile(checkpointer=checkpointer)
 
             state = OrchestratorState(
                 task_id=str(uuid4()),
@@ -683,8 +703,18 @@ class TestSupervisorOnlyGraphExecution:
                 topology="supervisor_only",
             )
 
-            result = await compiled.ainvoke(state)
-            final = OrchestratorState.model_validate(result)
+            # Run — will pause at HITL interrupt
+            config = {"configurable": {"thread_id": f"test-loop-{uuid4()}"}}
+            result = await compiled.ainvoke(state, config=config)
+            assert "__interrupt__" in result
+
+            # Resume with approve
+            from langgraph.types import Command
+
+            result2 = await compiled.ainvoke(
+                Command(resume="approve"), config=config
+            )
+            final = OrchestratorState.model_validate(result2)
 
             assert final.status == "completed"
             assert final.outcome in ("pr_opened", "success")

@@ -112,6 +112,37 @@ class ListTasksResponse(BaseModel):
     offset: int
 
 
+class HITLDecisionRequest(BaseModel):
+    """Request body for POST /tasks/{id}/hitl/decision.
+
+    VAL-HITL-CTRL-010: Invalid decision values (not 'approve' or 'reject')
+    trigger FastAPI/Pydantic validation → HTTP 422.
+    """
+
+    decision: str = Field(
+        ...,
+        description="Human decision: 'approve' or 'reject'",
+    )
+    reason: str | None = Field(default=None, description="Optional reason for the decision")
+
+    @field_validator("decision")
+    @classmethod
+    def _validate_decision(cls, v: str) -> str:
+        """Reject any decision value other than 'approve' or 'reject'."""
+        if v not in {"approve", "reject"}:
+            msg = f"Invalid decision {v!r}. Must be 'approve' or 'reject'"
+            raise ValueError(msg)
+        return v
+
+
+class HITLDecisionResponse(BaseModel):
+    """Response body for POST /tasks/{id}/hitl/decision."""
+
+    task_id: UUID
+    decision: str
+    status: str
+
+
 class ErrorResponse(BaseModel):
     """Error response — never leaks Python tracebacks (VAL-BACKEND-API-002)."""
 

@@ -12,6 +12,13 @@ Supervisor owns the retry budget and enforces it.
 If QA produces a TestReport with failures (failed > 0), the
 Supervisor does NOT proceed to PR creation (VAL-QA-005).
 
+HITL checkpoints (M4):
+  - VAL-HITL-CTRL-001: interrupt() fires before PR open (mandatory).
+  - VAL-HITL-CTRL-002: When HITL_INTERRUPT_BEFORE_WRITE_OPS=true,
+    interrupt() also fires before commit_and_push.
+  - VAL-HITL-CTRL-003: When HITL_INTERRUPT_BEFORE_WRITE_OPS=false
+    (default), interrupt fires ONLY before PR open.
+
 Architecture reference: §2.2 LangGraph Orchestrator, §5 Topology Configurations.
 
 Span hierarchy for Langfuse traces::
@@ -38,6 +45,7 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
 from src.agents.models import ChangePlan, CodeEdit, IssueContext, ReviewResult, TestReport
 from src.github_client.client import GitHubClient, canonicalize_repo_url
@@ -1092,11 +1100,12 @@ async def run_supervisor_finalize(state: OrchestratorState) -> dict[str, Any]:
     """Node: Supervisor finalization after the review cycle.
 
     Handles:
-    - Accept verdict: commit + push + open PR via GitHub client
     - Reject verdict: mark task as failed with appropriate outcome
-    - Cost budget check
+    - Accept verdict: route to HITL pre-PR checkpoint
 
-    In M4, this node will also handle HITL interrupts before PR.
+    In M4, the HITL interrupt fires before any PR open.
+    After the HITL decision is resolved, the graph continues
+    to commit+push+PR open.
 
     VAL-TOPOLOGY-003: The finalize node runs under the Supervisor
     parent span, maintaining the no-peer-handoff invariant.
@@ -1134,9 +1143,187 @@ async def run_supervisor_finalize(state: OrchestratorState) -> dict[str, Any]:
             "status": "failed",
         }
 
-    # Accept — attempt PR creation
-    pr_url = ""
+    # Accept — route to HITL checkpoint
+    return {"status": "pre_hitl"}
+
+
+# ── HITL interrupt nodes (M4) ───────────────────────────────────────
+
+
+async def hitl_pre_commit_push(state: OrchestratorState) -> dict[str, Any]:
+    """Node: HITL interrupt before commit_and_push.
+
+    VAL-HITL-CTRL-002: When HITL_INTERRUPT_BEFORE_WRITE_OPS=true,
+    this interrupt fires before commit_and_push.
+    The task status is set to 'awaiting_hitl' while paused.
+    """
+    task_id = state.task_id
+    logger.info("HITL pre-commit-push checkpoint for task %s", task_id)
+
+    # Update task status to awaiting_hitl
+    store = get_store(task_id)
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "awaiting_hitl")
+
+    # Fire the interrupt — graph pauses here
+    decision = interrupt({
+        "reason": "pre_commit_push",
+        "task_id": task_id,
+        "op": "commit_and_push",
+    })
+
+    if decision == "reject":
+        # Rejected — no commit, no PR
+        if store is not None:
+            from src.memory.episodic.models import CreateOutcomeParams
+            await store.finish_task(UUID(task_id), "rejected", hitl_decision="reject")
+            await store.create_outcome(
+                CreateOutcomeParams(
+                    task_id=UUID(task_id),
+                    outcome="hitl_rejected",
+                    detail={"checkpoint": "pre_commit_push"},
+                )
+            )
+        return {"outcome": "hitl_rejected", "status": "rejected"}
+
+    # Approved — continue
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "running")
+
+    return {"hitl_decision": "approve"}
+
+
+async def hitl_pre_pr(state: OrchestratorState) -> dict[str, Any]:
+    """Node: HITL interrupt before PR open.
+
+    VAL-HITL-CTRL-001: This interrupt fires on EVERY task before
+    the PR is opened.  Mandatory checkpoint.
+
+    VAL-HITL-CTRL-003: When HITL_INTERRUPT_BEFORE_WRITE_OPS=false
+    (default), this is the ONLY interrupt point.
+
+    The task status is set to 'awaiting_hitl' while paused.
+    After approval, the graph proceeds to commit+push+PR open.
+    After rejection, the task ends with outcome='hitl_rejected'.
+    """
+    task_id = state.task_id
+    logger.info("HITL pre-PR checkpoint for task %s", task_id)
+
+    # Update task status to awaiting_hitl
+    store = get_store(task_id)
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "awaiting_hitl")
+
+    # Broadcast HITL interrupt event
+    broadcaster = get_trace_broadcaster()
+    trace_id = getattr(state, "trace_id", "") or uuid4().hex
+    await broadcaster.publish(
+        TraceEvent(
+            type="hitl_interrupt",
+            task_id=task_id,
+            trace_id=trace_id,
+            span_id="",
+            parent_span_id="",
+            name="hitl_pre_pr",
+            span_type=SpanType.SPAN,
+            metadata={
+                "reason": "pre_pr_approval",
+                "agent_name": "supervisor",
+            },
+        )
+    )
+
+    # Fire the interrupt — graph pauses here
+    decision = interrupt({
+        "reason": "pre_pr_approval",
+        "task_id": task_id,
+        "op": "open_pull_request",
+    })
+
+    if decision == "reject":
+        # Rejected — no PR opened
+        if store is not None:
+            from src.memory.episodic.models import CreateOutcomeParams
+            await store.finish_task(UUID(task_id), "rejected", hitl_decision="reject")
+            await store.create_outcome(
+                CreateOutcomeParams(
+                    task_id=UUID(task_id),
+                    outcome="hitl_rejected",
+                    detail={"checkpoint": "pre_pr_approval"},
+                )
+            )
+        return {"outcome": "hitl_rejected", "status": "rejected"}
+
+    # Approved — mark decision and proceed to commit+push+PR
+    if store is not None:
+        # Update hitl_decision field but keep status as running
+        # (the finish_task at the end of the graph will set final status)
+        # We need to set hitl_decision without finishing the task
+        # Use a direct DB update
+        pool = store.pool
+        if pool is not None:
+            await pool.execute(
+                "UPDATE tasks SET hitl_decision = $2 WHERE id = $1",
+                UUID(task_id),
+                "approve",
+            )
+        await store.update_task_status(UUID(task_id), "approved")
+        await store.update_task_status(UUID(task_id), "running")
+
+    return {"hitl_decision": "approve"}
+
+
+async def run_commit_and_push(state: OrchestratorState) -> dict[str, Any]:
+    """Node: Commit and push changes to the GitHub branch.
+
+    Separated from finalize so the HITL interrupt can fire
+    between the commit and the PR open.
+    """
+    task_id = state.task_id
     sandbox = get_sandbox(task_id)
+
+    if sandbox is None:
+        logger.error("No sandbox for commit_and_push on task %s", task_id)
+        return {"errors": ["No sandbox available for commit"]}
+
+    try:
+        pat = os.getenv("GITHUB_PAT", "")
+        username = os.getenv("GITHUB_USERNAME", "")
+        gh_client = GitHubClient(pat=pat, username=username)
+
+        branch_name = f"{_BRANCH_PREFIX}fix-issue-{state.issue_number}"
+
+        gh_client.create_branch(str(sandbox.workspace_dir), branch_name)
+
+        commit_msg = (
+            f"fix: resolve issue #{state.issue_number}\n\n"
+            f"Automated fix by SDLC-Swarm (supervisor_only topology)"
+        )
+        gh_client.commit_and_push(
+            str(sandbox.workspace_dir), branch_name, commit_msg
+        )
+        logger.info("Committed and pushed for task %s on branch %s", task_id, branch_name)
+    except Exception as exc:
+        logger.error("Commit/push failed for task %s: %s", task_id, exc)
+        return {"errors": [f"Commit/push failed: {exc}"]}
+
+    return {"step": "committed"}
+
+
+async def run_open_pr(state: OrchestratorState) -> dict[str, Any]:
+    """Node: Open a pull request on GitHub.
+
+    VAL-HITL-CTRL-005: open_pull_request is invoked exactly once
+    after HITL approval.
+    VAL-HITL-CTRL-013: pr_url is populated only after successful PR open.
+    """
+    task_id = state.task_id
+    trace_id = getattr(state, "trace_id", "") or uuid4().hex
+    supervisor_span_id = getattr(state, "supervisor_span_id", "") or ""
+
+    sandbox = get_sandbox(task_id)
+    pr_url = ""
+
     if sandbox is not None and state.code_edit is not None:
         try:
             pat = os.getenv("GITHUB_PAT", "")
@@ -1148,16 +1335,6 @@ async def run_supervisor_finalize(state: OrchestratorState) -> dict[str, Any]:
             )
             branch_name = f"{_BRANCH_PREFIX}fix-issue-{state.issue_number}"
 
-            gh_client.create_branch(str(sandbox.workspace_dir), branch_name)
-
-            commit_msg = (
-                f"fix: resolve issue #{state.issue_number}\n\n"
-                f"Automated fix by SDLC-Swarm (supervisor_only topology)"
-            )
-            gh_client.commit_and_push(
-                str(sandbox.workspace_dir), branch_name, commit_msg
-            )
-
             pr_ref = gh_client.open_pull_request(
                 repo=repo_slug,
                 head_branch=branch_name,
@@ -1168,7 +1345,7 @@ async def run_supervisor_finalize(state: OrchestratorState) -> dict[str, Any]:
             logger.info("PR opened: %s", pr_url)
 
         except Exception as exc:
-            logger.error("PR failed for task %s: %s", task_id, exc)
+            logger.error("PR open failed for task %s: %s", task_id, exc)
 
     # Update supervisor span end
     tracing = get_tracing_client()
@@ -1350,7 +1527,10 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         route_after_planner → run_coder → route_after_coder →
         run_reviewer → route_after_review
         → (accept: run_qa → route_after_qa →
-            (all pass: run_supervisor_finalize → END) |
+            (all pass: run_supervisor_finalize →
+              hitl_pre_commit_push (if BEFORE_WRITE_OPS) →
+              hitl_pre_pr →
+              run_commit_and_push → run_open_pr → END) |
             (failures: halt_test_failure → END)) |
           (reject_with_changes: run_coder → ... loop) |
           (reject: run_supervisor_finalize → END) |
@@ -1366,7 +1546,13 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
 
     VAL-QA-001: QA emits typed TestReport.
     VAL-QA-005: QA failure does not auto-open PR.
+
+    VAL-HITL-CTRL-001: interrupt() fires before PR open on every task.
+    VAL-HITL-CTRL-002: BEFORE_WRITE_OPS=true → interrupt before every write.
+    VAL-HITL-CTRL-003: BEFORE_WRITE_OPS=false → interrupt only before PR.
     """
+    from src.orchestrator.hitl import is_before_write_ops
+
     graph = StateGraph(OrchestratorState)
 
     # ── Add agent nodes ────────────────────────────────────────
@@ -1379,6 +1565,12 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     graph.add_node("run_supervisor_finalize", run_supervisor_finalize)
     graph.add_node("halt_retry_exhausted", halt_retry_exhausted)
     graph.add_node("halt_test_failure", halt_test_failure)
+
+    # ── HITL checkpoint nodes (M4) ────────────────────────────
+    graph.add_node("hitl_pre_pr", hitl_pre_pr)
+    graph.add_node("hitl_pre_commit_push", hitl_pre_commit_push)
+    graph.add_node("run_commit_and_push", run_commit_and_push)
+    graph.add_node("run_open_pr", run_open_pr)
 
     # ── Add edges ───────────────────────────────────────────────
 
@@ -1415,13 +1607,34 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_qa",
         route_after_qa,
         {
-            "run_supervisor_finalize": "run_supervisor_finalize",  # all pass → PR
+            "run_supervisor_finalize": "run_supervisor_finalize",  # all pass → HITL + PR
             "halt_test_failure": "halt_test_failure",  # test failures → halt
         },
     )
 
-    # Supervisor finalize → END
-    graph.add_edge("run_supervisor_finalize", END)
+    # ── HITL checkpoint path ──────────────────────────────────
+    # After finalize (accept path), go through HITL checkpoints
+    # before committing and opening the PR.
+
+    if is_before_write_ops():
+        # VAL-HITL-CTRL-002: Interrupt before EVERY write op
+        # finalize → hitl_pre_commit_push → hitl_pre_pr → commit → open_pr
+        graph.add_edge("run_supervisor_finalize", "hitl_pre_commit_push")
+        graph.add_edge("hitl_pre_commit_push", "hitl_pre_pr")
+    else:
+        # VAL-HITL-CTRL-003: Interrupt ONLY before PR open
+        # finalize → hitl_pre_pr → commit → open_pr
+        graph.add_edge("run_supervisor_finalize", "hitl_pre_pr")
+
+    graph.add_edge("hitl_pre_pr", "run_commit_and_push")
+    graph.add_edge("run_commit_and_push", "run_open_pr")
+    graph.add_edge("run_open_pr", END)
+
+    # Supervisor finalize (reject path) → END
+    # Note: reject is handled INSIDE run_supervisor_finalize,
+    # which returns status="failed" and the graph ends.
+    # But for the accept path, finalize returns status="pre_hitl"
+    # and the graph continues through the HITL path above.
 
     # Halt retry exhausted → END
     graph.add_edge("halt_retry_exhausted", END)

@@ -97,6 +97,9 @@ class OrchestratorState(BaseModel):
     errors: list[str] = []
     retry_count: int = 0
 
+    # HITL decision tracking (M4)
+    hitl_decision: str = ""
+
     # Result
     pr_url: str = ""
     outcome: str = ""
@@ -521,11 +524,25 @@ class Orchestrator:
             )
             raise ValueError(msg)
 
-        compiled = graph.compile()
+        # Compile with checkpointer for HITL interrupt/resume
+        # (VAL-HITL-CTRL-001, VAL-CROSS-018, VAL-CROSS-019)
+        from src.orchestrator.hitl import (
+            get_shared_checkpointer,
+            register_graph,
+            unregister_graph,
+        )
+
+        checkpointer = get_shared_checkpointer()
+        compiled = graph.compile(checkpointer=checkpointer)
+
+        # Register the graph for HITL resume
+        thread_id = f"task-{task_id}"
+        register_graph(task_id, compiled, thread_id, checkpointer)
 
         # Execute the graph
         try:
-            result = await compiled.ainvoke(initial_state)
+            config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+            result = await compiled.ainvoke(initial_state, config=config)  # type: ignore[call-overload]
         except Exception as exc:
             logger.error(
                 "Graph execution failed for task %s: %s", task_id, exc
@@ -540,6 +557,7 @@ class Orchestrator:
                 if ss is not None:
                     with contextlib.suppress(Exception):
                         await ss.close()
+            unregister_graph(task_id)
             await self.store.finish_task(UUID(task_id), "failed")
             await self.store.create_outcome(
                 CreateOutcomeParams(
@@ -552,7 +570,44 @@ class Orchestrator:
                 update={"status": "failed", "outcome": "sandbox_failure"}
             )
 
-        # Process the result
+        # Check if the graph hit an HITL interrupt
+        # (VAL-HITL-CTRL-001: interrupt fires before PR open)
+        if "__interrupt__" in result:
+            logger.info(
+                "Graph paused at HITL interrupt for task %s", task_id
+            )
+            # Task status was already set to 'awaiting_hitl' by the
+            # interrupt node.  The sandbox and stores stay alive for
+            # the resume path.  The graph stays registered so the
+            # HITL decision endpoint can resume it.
+            # DO NOT teardown sandbox or unregister graph here.
+            # That happens when the graph completes after resume.
+
+            # Update totals so far
+            partial_state_data = {k: v for k, v in result.items() if k != "__interrupt__"}
+            if partial_state_data:
+                try:
+                    partial_state = OrchestratorState.model_validate(partial_state_data)
+                    await self.store.update_task_totals(
+                        UUID(task_id),
+                        total_cost_usd=partial_state.total_cost_usd,
+                        total_tokens_in=partial_state.total_tokens_in,
+                        total_tokens_out=partial_state.total_tokens_out,
+                        total_tokens_cached=partial_state.total_tokens_cached,
+                    )
+                except Exception:
+                    logger.warning("Could not extract partial state from interrupt result")
+
+            # Flush Langfuse traces (partial trace so far)
+            tracing = get_tracing_client()
+            tracing.flush()
+
+            # Return the initial state (the graph is paused, not completed)
+            return initial_state.model_copy(
+                update={"status": "awaiting_hitl"}
+            )
+
+        # Process the result (graph completed normally)
         final_state = OrchestratorState.model_validate(result)
 
         # Teardown sandbox if it was provisioned
@@ -565,6 +620,9 @@ class Orchestrator:
             if ss is not None:
                 with contextlib.suppress(Exception):
                     await ss.close()
+
+        # Unregister the graph (completed normally)
+        unregister_graph(task_id)
 
         # Flush Langfuse traces
         tracing = get_tracing_client()

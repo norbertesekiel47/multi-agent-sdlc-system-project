@@ -38,6 +38,8 @@ from src.api.errors import (
 from src.api.models import (
     CreateTaskRequest,
     CreateTaskResponse,
+    HITLDecisionRequest,
+    HITLDecisionResponse,
     ListTasksResponse,
     TaskDetailResponse,
     TaskListItemResponse,
@@ -309,6 +311,153 @@ async def get_task(
         started_at=row.started_at,
         ended_at=row.ended_at,
     )
+
+
+# ── POST /tasks/{id}/hitl/decision ────────────────────────────────────
+
+
+@app.post("/tasks/{task_id}/hitl/decision", response_model=HITLDecisionResponse)
+async def hitl_decision(
+    task_id: UUID,
+    body: HITLDecisionRequest,
+    store: EpisodicStore = Depends(get_store),  # noqa: B008
+) -> HITLDecisionResponse:
+    """Resolve an HITL interrupt for a task.
+
+    VAL-HITL-CTRL-004: POST approve resumes the LangGraph.
+    VAL-HITL-CTRL-006: POST reject ends task without PR.
+    VAL-HITL-CTRL-008: Second decision returns 409.
+    VAL-HITL-CTRL-009: Task not in awaiting_hitl returns 409.
+    VAL-HITL-CTRL-010: Invalid body returns 422 (handled by Pydantic).
+    VAL-HITL-CTRL-011: Unknown task returns 404.
+    """
+    # Check task exists
+    task = await store.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task_not_found")
+
+    # VAL-HITL-CTRL-008: Decision already made (check BEFORE status
+    # because after a decision, the status may have changed)
+    if task.hitl_decision is not None:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "decision_already_made",
+                "current_decision": task.hitl_decision,
+            },
+        )
+
+    # VAL-HITL-CTRL-009: Task must be in awaiting_hitl status
+    if task.status != "awaiting_hitl":
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "task_not_awaiting_hitl",
+                "current_status": task.status,
+            },
+        )
+
+    decision = body.decision
+    reason = body.reason
+
+    if decision == "approve":
+        # VAL-HITL-CTRL-004: Approve → resume LangGraph
+        # VAL-HITL-CTRL-005: Approve → open_pull_request invoked (by resumed graph)
+        # Record the HITL decision on the task row (without finishing the task)
+        await store._pool.execute(
+            "UPDATE tasks SET hitl_decision = $2 WHERE id = $1",
+            task_id,
+            "approve",
+        )
+        await store.update_task_status(task_id, "approved")
+
+        # Try to resume the orchestrator graph if it's checkpointed
+        await _resume_orchestrator_if_active(task_id, "approve")
+
+        # Check current status (might have been updated by resumed graph)
+        updated_task = await store.get_task(task_id)
+        final_status = updated_task.status if updated_task else "approved"
+
+        # If status is still 'approved' (graph didn't complete yet),
+        # mark as running so the graph can continue
+        if final_status == "approved":
+            await store.update_task_status(task_id, "running")
+
+        logger.info(
+            "HITL approve for task %s, reason=%s",
+            task_id,
+            reason,
+        )
+
+        # Re-fetch to get final status
+        updated_task = await store.get_task(task_id)
+        final_status = updated_task.status if updated_task else "running"
+
+        return HITLDecisionResponse(
+            task_id=task_id,
+            decision="approve",
+            status=final_status,
+        )
+
+    else:
+        # decision == "reject"
+        # VAL-HITL-CTRL-006: Reject → no PR, task rejected
+        # VAL-HITL-CTRL-007: Write hitl_rejected outcome
+        from src.memory.episodic.models import CreateOutcomeParams
+
+        await store.finish_task(
+            task_id,
+            "rejected",
+            hitl_decision="reject",
+        )
+        await store.create_outcome(
+            CreateOutcomeParams(
+                task_id=task_id,
+                outcome="hitl_rejected",
+                detail={"reason": reason} if reason else {},
+            )
+        )
+
+        logger.info(
+            "HITL reject for task %s, reason=%s",
+            task_id,
+            reason,
+        )
+
+        return HITLDecisionResponse(
+            task_id=task_id,
+            decision="reject",
+            status="rejected",
+        )
+
+
+async def _resume_orchestrator_if_active(task_id: UUID, decision: str) -> None:
+    """Resume a paused LangGraph for the given task if it's checkpointed.
+
+    Looks up the task's compiled graph and checkpointer, then resumes
+    execution with the HITL decision.  This is the core of the
+    interrupt/resume flow.
+
+    If no active graph is found (e.g., the task hasn't started yet
+    or the graph already completed), this is a no-op.
+    """
+    from src.orchestrator.hitl import resume_graph
+
+    try:
+        resumed = await resume_graph(str(task_id), decision)
+        if resumed:
+            logger.info("Resumed graph for task %s with decision=%s", task_id, decision)
+    except Exception:
+        logger.warning(
+            "Failed to resume graph for task %s (decision=%s)",
+            task_id,
+            decision,
+            exc_info=True,
+        )
 
 
 # ── WS /events/stream ────────────────────────────────────────────────
