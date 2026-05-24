@@ -39,6 +39,12 @@ _MODEL_PRICING: dict[str, dict[str, float]] = {
         "input_per_mtok": 0.10,
         "output_per_mtok": 0.40,
     },
+    "deepseek/deepseek-chat-v3-0324": {
+        # Stable fallback for Coder/Reviewer/QA (per AGENTS.md)
+        # Same pricing tier as DeepSeek V4 Flash
+        "input_per_mtok": 0.10,
+        "output_per_mtok": 0.40,
+    },
     # OpenAI embedding pricing
     "text-embedding-3-small": {
         "input_per_mtok": 0.02,

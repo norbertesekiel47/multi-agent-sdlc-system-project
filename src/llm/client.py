@@ -22,6 +22,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from src.llm.caching import StructuredPrompt
 from src.llm.cost import (
     extract_cached_tokens,
     extract_cost_from_response,
@@ -252,6 +253,61 @@ class LLMClient:
             cached_tokens=cached_tokens,
             cost_usd=cost_usd,
             span_id=span_id,
+        )
+
+    async def chat_with_cache(
+        self,
+        *,
+        structured_prompt: StructuredPrompt,
+        model: str,
+        task_id: str,
+        trace_id: str,
+        parent_span_id: str | None = None,
+        agent_name: str = "",
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> LLMCallResult:
+        """Send a chat completion request using a StructuredPrompt with cache markers.
+
+        This is the primary entry point for Coder and Reviewer agents
+        that benefit from prompt caching (§2.10).  It:
+
+        1. Converts the structured prompt to messages with cache_control
+           markers appropriate for the model family.
+        2. Sends the request to OpenRouter.
+        3. Records cached_tokens from the response onto the Langfuse span.
+
+        Args:
+            structured_prompt: A StructuredPrompt with static (cacheable) and
+                dynamic blocks.
+            model: The model identifier (e.g. ``deepseek/deepseek-chat-v3-0324``).
+            task_id: The current task's ID.
+            trace_id: Langfuse trace ID for span hierarchy.
+            parent_span_id: Optional parent span ID.
+            agent_name: Name of the agent making the call (e.g. "coder").
+            temperature: Sampling temperature (0.0 for benchmark, 0.2 default).
+            max_tokens: Maximum tokens in the response.
+            extra_metadata: Additional metadata for the Langfuse span.
+
+        Returns:
+            An LLMCallResult with cached_tokens from the OpenRouter response.
+        """
+        messages = structured_prompt.to_messages_with_cache_markers(model=model)
+
+        return await self.chat(
+            model=model,
+            messages=messages,
+            task_id=task_id,
+            trace_id=trace_id,
+            parent_span_id=parent_span_id,
+            agent_name=agent_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_metadata={
+                "prompt_caching": True,
+                **(extra_metadata or {}),
+            },
         )
 
 
