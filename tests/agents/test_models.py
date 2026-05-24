@@ -291,7 +291,7 @@ class TestSingleAgentOutput:
             diff="some diff",
             touched_files=["src/main.py"],
         )
-        report = TestReport(passed=3, failed=2)
+        report = TestReport(passed=3, failed=2, failed_test_names=["test_a", "test_b"])
         output = SingleAgentOutput(
             plan=plan,
             code_edit=edit,

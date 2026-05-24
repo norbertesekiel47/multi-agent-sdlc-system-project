@@ -4,9 +4,13 @@ Supervisor routes between Planner → Coder → Reviewer → QA sequentially.
 No peer handoff between Coder and Reviewer — all routing goes through
 the Supervisor node (VAL-TOPOLOGY-002, VAL-TOPOLOGY-003).
 
+If Reviewer verdict is ``accept``, the Supervisor routes to QA.
 If Reviewer verdict is ``reject_with_changes``, the Supervisor
 re-routes to Coder (sequential loop, not peer swarm).  The
 Supervisor owns the retry budget and enforces it.
+
+If QA produces a TestReport with failures (failed > 0), the
+Supervisor does NOT proceed to PR creation (VAL-QA-005).
 
 Architecture reference: §2.2 LangGraph Orchestrator, §5 Topology Configurations.
 
@@ -16,7 +20,7 @@ Span hierarchy for Langfuse traces::
       ├── Planner (LLM span)
       ├── Coder (LLM span)
       ├── Reviewer (LLM span)
-      └── (QA in M4)
+      └── QA (LLM span)
 
 All agent spans have the Supervisor span as their parent —
 never another agent span.  This distinguishes supervisor_only
@@ -35,7 +39,7 @@ from uuid import UUID, uuid4
 
 from langgraph.graph import END, START, StateGraph
 
-from src.agents.models import ChangePlan, CodeEdit, IssueContext, ReviewResult
+from src.agents.models import ChangePlan, CodeEdit, IssueContext, ReviewResult, TestReport
 from src.github_client.client import GitHubClient, canonicalize_repo_url
 from src.llm.cost import estimate_cost_tiktoken, get_max_cost_per_task
 from src.orchestrator import OrchestratorState
@@ -153,10 +157,10 @@ def route_after_coder(state: OrchestratorState) -> Literal["run_reviewer"]:
 
 def route_after_review(
     state: OrchestratorState,
-) -> Literal["run_coder", "run_supervisor_finalize", "halt_retry_exhausted"]:
+) -> Literal["run_qa", "run_coder", "run_supervisor_finalize", "halt_retry_exhausted"]:
     """After Reviewer, route based on verdict.
 
-    - ``accept``: advance to Supervisor finalize (→ PR or end)
+    - ``accept``: advance to QA (VAL-QA-001, VAL-QA-003)
     - ``reject_with_changes``: re-route to Coder (if retry budget
       allows), otherwise halt with retry_budget_exhausted
     - ``reject``: advance to Supervisor finalize (terminal rejection)
@@ -164,6 +168,9 @@ def route_after_review(
     VAL-TOPOLOGY-003: In supervisor_only, the re-route goes through
     the Supervisor (this routing function IS the Supervisor's
     routing logic).  There is NO direct Reviewer→Coder peer edge.
+
+    VAL-REVIEWER-004: When ReviewResult.verdict == 'accept', the
+    orchestrator routes to QA next, not back to Coder.
     """
     review = state.review_result
     if review is None:
@@ -172,8 +179,8 @@ def route_after_review(
         return "run_supervisor_finalize"
 
     if review.verdict == "accept":
-        # Accept: advance to finalize
-        return "run_supervisor_finalize"
+        # Accept: advance to QA (VAL-REVIEWER-004, VAL-QA-001)
+        return "run_qa"
 
     if review.verdict == "reject":
         # Terminal rejection: advance to finalize (will set outcome)
@@ -768,6 +775,253 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
+# ── Route after QA ──────────────────────────────────────────────────
+
+
+def route_after_qa(
+    state: OrchestratorState,
+) -> Literal["run_supervisor_finalize", "halt_test_failure"]:
+    """After QA, route based on test results.
+
+    - All pass (failed == 0): advance to Supervisor finalize (→ PR)
+    - Failures (failed > 0): halt with test failure (VAL-QA-005)
+
+    VAL-QA-005: When TestReport.failed > 0, the orchestrator does
+    NOT proceed to PR creation. It either retries (within budget)
+    or escalates to HITL with cause persistent_test_failure.
+    """
+    report = state.test_report
+    if report is None:
+        # No test report — should not happen, advance to finalize
+        logger.warning("route_after_qa called with no test_report")
+        return "run_supervisor_finalize"
+
+    if report.failed > 0:
+        # Test failures: do NOT open PR (VAL-QA-005)
+        logger.warning(
+            "QA found %d failing test(s) for task %s — NOT opening PR",
+            report.failed,
+            state.task_id,
+        )
+        return "halt_test_failure"
+
+    # All tests pass: advance to finalize
+    return "run_supervisor_finalize"
+
+
+# ── Node: Run QA Agent ──────────────────────────────────────────────
+
+
+async def run_qa(state: OrchestratorState) -> dict[str, Any]:
+    """Node: Run the QA agent.
+
+    Creates a Langfuse span for the QA under the Supervisor
+    parent span.  Calls run_qa() with the CodeEdit.
+    Persists the TestReport as a decision row.
+
+    VAL-QA-001: QA emits typed TestReport.
+    VAL-QA-002: QA generates test files in sandbox.
+    VAL-QA-003: QA executes the test runner in sandbox.
+    VAL-QA-004: TestReport persisted as decision.
+    VAL-QA-005: QA failure does not auto-open PR.
+    VAL-QA-006: failed_test_names length must equal failed.
+
+    VAL-TOPOLOGY-003: QA span's parent is the Supervisor span.
+    """
+    task_id = state.task_id
+    trace_id = getattr(state, "trace_id", "") or uuid4().hex
+    supervisor_span_id = getattr(state, "supervisor_span_id", "") or ""
+
+    logger.info("QA node for task %s (step %d)", task_id, state.step_index)
+
+    # Create QA span under Supervisor parent (VAL-TOPOLOGY-003)
+    tracing = get_tracing_client()
+    qa_span_id = tracing.create_span(
+        trace_id=trace_id,
+        parent_span_id=supervisor_span_id or None,
+        name="qa",
+        span_type=SpanType.SPAN,
+        input_data={
+            "code_edit": _trunc_json(state.code_edit) if state.code_edit else None,
+        },
+        metadata={
+            "task_id": task_id,
+            "agent_name": "qa",
+        },
+        start_time=datetime.now(UTC),
+    )
+
+    # Broadcast node_start event
+    await _emit_trace_event(
+        task_id=task_id,
+        trace_id=trace_id,
+        span_id=qa_span_id or "",
+        parent_span_id=supervisor_span_id,
+        name="qa",
+        event_type="node_start",
+        metadata={"agent_name": "qa"},
+    )
+
+    # Run the QA agent
+    report: TestReport | None = None
+    cost_usd = Decimal("0")
+    tokens_in = 0
+    tokens_out = 0
+    cached_tokens = 0
+
+    if state.code_edit is not None:
+        try:
+            from src.agents.qa import QARunResult
+            from src.agents.qa import run_qa as _run_qa_agent
+
+            sandbox = get_sandbox(task_id)
+            store = get_store(task_id)
+            qa_result: QARunResult = await _run_qa_agent(
+                code_edit=state.code_edit,
+                sandbox_manager=sandbox,
+                episodic_store=store,
+                task_id=UUID(task_id) if task_id else None,
+                trace_id=trace_id,
+                repo_url=state.repo_url,
+            )
+            report = qa_result.report
+            tokens_in = qa_result.tokens_in
+            tokens_out = qa_result.tokens_out
+            cached_tokens = qa_result.cached_tokens
+            cost_usd = qa_result.cost_usd
+
+        except Exception as exc:
+            logger.error("QA agent failed for task %s: %s", task_id, exc)
+            tracing.update_span(
+                trace_id=trace_id,
+                span_id=qa_span_id or "",
+                output_data={"error": str(exc)[:500]},
+                end_time=datetime.now(UTC),
+                level="ERROR",
+            )
+            await _emit_trace_event(
+                task_id=task_id,
+                trace_id=trace_id,
+                span_id=qa_span_id or "",
+                parent_span_id=supervisor_span_id,
+                name="qa",
+                event_type="node_end",
+                metadata={"agent_name": "qa", "error": str(exc)[:200]},
+            )
+            return {
+                "errors": [f"QA failed: {exc}"],
+                "outcome": "sandbox_failure",
+                "status": "failed",
+            }
+
+    # Update QA span end
+    tracing.update_span(
+        trace_id=trace_id,
+        span_id=qa_span_id or "",
+        output_data=report.model_dump(mode="json") if report else None,
+        end_time=datetime.now(UTC),
+        metadata={
+            "agent_name": "qa",
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cached_tokens": cached_tokens,
+            "cost_usd": str(cost_usd),
+            "passed": report.passed if report else None,
+            "failed": report.failed if report else None,
+        },
+    )
+
+    # Broadcast node_end event
+    await _emit_trace_event(
+        task_id=task_id,
+        trace_id=trace_id,
+        span_id=qa_span_id or "",
+        parent_span_id=supervisor_span_id,
+        name="qa",
+        event_type="node_end",
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cost_usd=cost_usd,
+        metadata={
+            "agent_name": "qa",
+            "cached_tokens": cached_tokens,
+            "passed": report.passed if report else None,
+            "failed": report.failed if report else None,
+        },
+    )
+
+    new_total_cost = state.total_cost_usd + cost_usd
+
+    # Check cost budget
+    max_cost = get_max_cost_per_task()
+    if new_total_cost > max_cost:
+        return {
+            "outcome": "cost_budget_exhausted",
+            "total_cost_usd": new_total_cost,
+            "status": "failed",
+        }
+
+    return {
+        "test_report": report,
+        "total_cost_usd": new_total_cost,
+        "total_tokens_in": state.total_tokens_in + tokens_in,
+        "total_tokens_out": state.total_tokens_out + tokens_out,
+        "total_tokens_cached": state.total_tokens_cached + cached_tokens,
+    }
+
+
+async def halt_test_failure(state: OrchestratorState) -> dict[str, Any]:
+    """Node: Halt the task because tests failed (VAL-QA-005).
+
+    When TestReport.failed > 0, the orchestrator does NOT open a PR.
+    Writes an outcome row and marks the task as failed.
+    In M4, this will trigger an HITL interrupt with cause
+    persistent_test_failure.
+    """
+    task_id = state.task_id
+    report = state.test_report
+
+    logger.warning(
+        "Test failure halt for task %s: %d passed, %d failed",
+        task_id,
+        report.passed if report else 0,
+        report.failed if report else 0,
+    )
+
+    # Update supervisor span end with failure
+    trace_id = getattr(state, "trace_id", "") or uuid4().hex
+    supervisor_span_id = getattr(state, "supervisor_span_id", "") or ""
+    tracing = get_tracing_client()
+    tracing.update_span(
+        trace_id=trace_id,
+        span_id=supervisor_span_id,
+        output_data={
+            "outcome": "persistent_test_failure",
+            "failed_test_names": report.failed_test_names if report else [],
+        },
+        end_time=datetime.now(UTC),
+        level="ERROR",
+    )
+    await _emit_trace_event(
+        task_id=task_id,
+        trace_id=trace_id,
+        span_id=supervisor_span_id,
+        parent_span_id=None,
+        name="supervisor",
+        event_type="node_end",
+        metadata={
+            "agent_name": "supervisor",
+            "outcome": "persistent_test_failure",
+            "failed_test_names": report.failed_test_names if report else [],
+        },
+    )
+
+    return {
+        "outcome": "persistent_test_failure",
+        "status": "failed",
+    }
+
+
 async def run_supervisor(state: OrchestratorState) -> dict[str, Any]:
     """Node: Supervisor routing node.
 
@@ -1095,17 +1349,23 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         START → run_supervisor → index_repo → run_planner →
         route_after_planner → run_coder → route_after_coder →
         run_reviewer → route_after_review
-        → (accept: run_supervisor_finalize → END) |
+        → (accept: run_qa → route_after_qa →
+            (all pass: run_supervisor_finalize → END) |
+            (failures: halt_test_failure → END)) |
           (reject_with_changes: run_coder → ... loop) |
+          (reject: run_supervisor_finalize → END) |
           (retry exhausted: halt_retry_exhausted → END)
 
     VAL-TOPOLOGY-002: The agent span first-occurrence order is
-    exactly [planner, coder, reviewer] under the Supervisor parent.
+    exactly [planner, coder, reviewer, qa] under the Supervisor parent.
 
     VAL-TOPOLOGY-003: No Coder→Reviewer peer handoff edges.  All
     routing decisions are made by the Supervisor (route_after_review).
 
     VAL-RAG-008: index_repo runs before run_planner.
+
+    VAL-QA-001: QA emits typed TestReport.
+    VAL-QA-005: QA failure does not auto-open PR.
     """
     graph = StateGraph(OrchestratorState)
 
@@ -1115,8 +1375,10 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     graph.add_node("run_planner", run_planner)
     graph.add_node("run_coder", run_coder)
     graph.add_node("run_reviewer", run_reviewer)
+    graph.add_node("run_qa", run_qa)
     graph.add_node("run_supervisor_finalize", run_supervisor_finalize)
     graph.add_node("halt_retry_exhausted", halt_retry_exhausted)
+    graph.add_node("halt_test_failure", halt_test_failure)
 
     # ── Add edges ───────────────────────────────────────────────
 
@@ -1141,9 +1403,20 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_reviewer",
         route_after_review,
         {
+            "run_qa": "run_qa",  # accept → QA (VAL-REVIEWER-004)
             "run_coder": "run_coder",  # reject_with_changes loop
-            "run_supervisor_finalize": "run_supervisor_finalize",  # accept/reject
+            "run_supervisor_finalize": "run_supervisor_finalize",  # reject
             "halt_retry_exhausted": "halt_retry_exhausted",  # budget exhausted
+        },
+    )
+
+    # QA → conditional routing based on test results (VAL-QA-005)
+    graph.add_conditional_edges(
+        "run_qa",
+        route_after_qa,
+        {
+            "run_supervisor_finalize": "run_supervisor_finalize",  # all pass → PR
+            "halt_test_failure": "halt_test_failure",  # test failures → halt
         },
     )
 
@@ -1152,5 +1425,8 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
 
     # Halt retry exhausted → END
     graph.add_edge("halt_retry_exhausted", END)
+
+    # Halt test failure → END (VAL-QA-005)
+    graph.add_edge("halt_test_failure", END)
 
     return graph

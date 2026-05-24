@@ -25,6 +25,7 @@ from src.agents.models import (
     IssueContext,
     ReviewResult,
     SingleAgentOutput,
+    TestReport,
 )
 from src.agents.single_agent import SandboxTools, single_agent
 from src.github_client.client import GitHubClient, canonicalize_repo_url
@@ -76,6 +77,7 @@ class OrchestratorState(BaseModel):
     change_plan: ChangePlan | None = None
     code_edit: CodeEdit | None = None
     review_result: ReviewResult | None = None
+    test_report: TestReport | None = None
 
     # Step tracking (supervisor_only / hybrid)
     step_index: int = 0
