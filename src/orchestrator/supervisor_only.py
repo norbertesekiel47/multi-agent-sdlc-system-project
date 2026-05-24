@@ -311,11 +311,46 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
         except Exception:
             pass
 
+    # ── Episodic memory pre-fetch (VAL-CROSS-013, VAL-CROSS-014) ───
+    # Query the episodic store for repo_facts, recent decisions,
+    # and recent outcomes scoped to the current repo_url BEFORE
+    # building the IssueContext.  This ensures the Planner has
+    # immediate context from prior tasks on the same repo.
+    repo_facts_data: list[dict[str, Any]] = []
+    recent_decisions_data: list[dict[str, Any]] = []
+    recent_outcomes_data: list[dict[str, Any]] = []
+
+    store = get_store(task_id)
+    if store is not None:
+        try:
+            episodic_ctx = await store.get_planner_context(
+                repo_url=state.repo_url,
+                recent_limit=5,
+            )
+            repo_facts_data = episodic_ctx.get("repo_facts", [])
+            recent_decisions_data = episodic_ctx.get("recent_decisions", [])
+            recent_outcomes_data = episodic_ctx.get("recent_outcomes", [])
+            logger.info(
+                "Planner pre-fetched episodic context for %s: "
+                "%d facts, %d decisions, %d outcomes",
+                state.repo_url,
+                len(repo_facts_data),
+                len(recent_decisions_data),
+                len(recent_outcomes_data),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Episodic context pre-fetch failed for task %s: %s",
+                task_id, exc,
+            )
+
     issue_context = IssueContext(
         repo_url=state.repo_url,
         issue_number=state.issue_number,
         issue_text=state.issue_text,
         repo_files=repo_files,
+        repo_facts=repo_facts_data,
+        recent_decisions=recent_decisions_data,
     )
 
     # Run the Planner agent
@@ -327,7 +362,6 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
     try:
         from src.agents.planner import run_planner as _run_planner_agent
 
-        store = get_store(task_id)
         semantic_store = get_semantic_store(task_id)
         plan = await _run_planner_agent(
             issue_context=issue_context,

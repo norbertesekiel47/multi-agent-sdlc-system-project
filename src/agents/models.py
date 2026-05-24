@@ -6,7 +6,7 @@ Free-form text outside the typed schema is rejected.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -52,7 +52,7 @@ class IssueContext(BaseModel):
         default_factory=dict,
         description="Map of file_path -> file_content for repo context",
     )
-    repo_facts: list[dict[str, str]] = Field(
+    repo_facts: list[dict[str, Any]] = Field(
         default_factory=list,
         description="Episodic repo_facts for this repo_url",
     )
