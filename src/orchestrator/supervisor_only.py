@@ -142,6 +142,96 @@ def unregister_semantic_store(task_id: str) -> SemanticStore | None:
     return _active_semantic_stores.pop(task_id, None)
 
 
+# ── Guardrail Registry ────────────────────────────────────────────
+# Invariant guardrails (VAL-GUARDRAIL-001 through VAL-GUARDRAIL-011).
+# The GuardrailSandboxProxy wraps the SandboxManager and intercepts
+# tool calls before dispatch.
+
+from src.guardrails.errors import GuardrailViolation  # noqa: E402
+from src.guardrails.middleware import (  # noqa: E402
+    GuardrailMiddleware,
+    GuardrailSandboxProxy,
+)
+
+_active_guardrails: dict[str, GuardrailMiddleware] = {}
+_active_sandbox_proxies: dict[str, GuardrailSandboxProxy] = {}
+
+
+def register_guardrail(task_id: str, guardrail: GuardrailMiddleware) -> None:
+    """Register a guardrail middleware and sandbox proxy for a task.
+
+    Creates a GuardrailSandboxProxy wrapping the task's sandbox
+    so that agent tool calls go through guardrail checks.
+    """
+    _active_guardrails[task_id] = guardrail
+    sandbox = get_sandbox(task_id)
+    if sandbox is not None:
+        proxy = GuardrailSandboxProxy(sandbox, guardrail)
+        _active_sandbox_proxies[task_id] = proxy
+
+
+def get_guardrail(task_id: str) -> GuardrailMiddleware | None:
+    """Look up the guardrail middleware for a task."""
+    return _active_guardrails.get(task_id)
+
+
+def get_sandbox_proxy(task_id: str) -> GuardrailSandboxProxy | None:
+    """Look up the guardrail-wrapped sandbox proxy for a task.
+
+    This should be used in agent deps instead of the raw sandbox
+    so that all tool calls go through guardrail checks.
+    """
+    return _active_sandbox_proxies.get(task_id)
+
+
+def unregister_guardrail(task_id: str) -> None:
+    """Remove guardrail and proxy from the registry."""
+    _active_guardrails.pop(task_id, None)
+    _active_sandbox_proxies.pop(task_id, None)
+
+
+async def _handle_guardrail_violation(
+    *,
+    violation: GuardrailViolation,
+    task_id: str,
+    trace_id: str,
+    span_id: str | None,
+    parent_span_id: str | None,
+) -> dict[str, Any]:
+    """Handle a GuardrailViolation from an agent tool call.
+
+    VAL-GUARDRAIL-007: Emits a Langfuse span tagged guardrail.violation.
+    VAL-GUARDRAIL-008: Writes an outcomes row with outcome=guardrail_block.
+    VAL-GUARDRAIL-009: Halts the agent and escalates to HITL.
+
+    Returns the state update dict that the calling node should return.
+    The caller must then trigger interrupt() for HITL escalation.
+    """
+    from src.guardrails.middleware import report_guardrail_violation
+
+    await report_guardrail_violation(
+        violation=violation,
+        task_id=task_id,
+        trace_id=trace_id,
+        parent_span_id=parent_span_id,
+    )
+
+    logger.warning(
+        "Guardrail violation in task %s: rule=%s, tool=%s",
+        task_id,
+        violation.rule_name,
+        violation.tool_name,
+    )
+
+    # Return state update for the node — the graph's HITL interrupt
+    # node will pick this up and trigger interrupt()
+    return {
+        "errors": [f"Guardrail violation: {violation.rule_name} — {violation.detail}"],
+        "outcome": "guardrail_block",
+        "status": "awaiting_hitl",
+    }
+
+
 # ── Routing functions ───────────────────────────────────────────────
 
 
@@ -540,10 +630,13 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
+            # Use guardrail-wrapped sandbox proxy for agent deps
+            # (VAL-GUARDRAIL-011: middleware intercepts tool calls before executor)
+            sandbox_proxy = get_sandbox_proxy(task_id)
             coder_result: CoderRunResult = await _run_coder_agent(
                 change_plan=state.change_plan,
                 review_result=state.review_result,
-                sandbox_manager=sandbox,
+                sandbox_manager=sandbox_proxy or sandbox,
                 episodic_store=store,
                 task_id=UUID(task_id) if task_id else None,
                 trace_id=trace_id,
@@ -555,6 +648,19 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
             cached_tokens = coder_result.cached_tokens
             cost_usd = coder_result.cost_usd
 
+        except GuardrailViolation as gv:
+            # VAL-GUARDRAIL-007..009: report to Langfuse + outcomes + HITL
+            logger.warning(
+                "Guardrail violation in Coder for task %s: %s",
+                task_id, gv.rule_name,
+            )
+            return await _handle_guardrail_violation(
+                violation=gv,
+                task_id=task_id,
+                trace_id=trace_id,
+                span_id=coder_span_id,
+                parent_span_id=supervisor_span_id,
+            )
         except Exception as exc:
             logger.error("Coder agent failed for task %s: %s", task_id, exc)
             tracing.update_span(
@@ -691,9 +797,11 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
+            # Use guardrail-wrapped sandbox proxy (VAL-GUARDRAIL-011)
+            sandbox_proxy = get_sandbox_proxy(task_id)
             reviewer_result: ReviewerRunResult = await _run_reviewer_agent(
                 code_edit=state.code_edit,
-                sandbox_manager=sandbox,
+                sandbox_manager=sandbox_proxy or sandbox,
                 episodic_store=store,
                 task_id=UUID(task_id) if task_id else None,
                 trace_id=trace_id,
@@ -705,6 +813,19 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
             cached_tokens = reviewer_result.cached_tokens
             cost_usd = reviewer_result.cost_usd
 
+        except GuardrailViolation as gv:
+            # VAL-GUARDRAIL-007..009: report to Langfuse + outcomes + HITL
+            logger.warning(
+                "Guardrail violation in Reviewer for task %s: %s",
+                task_id, gv.rule_name,
+            )
+            return await _handle_guardrail_violation(
+                violation=gv,
+                task_id=task_id,
+                trace_id=trace_id,
+                span_id=reviewer_span_id,
+                parent_span_id=supervisor_span_id,
+            )
         except Exception as exc:
             logger.error("Reviewer agent failed for task %s: %s", task_id, exc)
             tracing.update_span(
@@ -884,9 +1005,11 @@ async def run_qa(state: OrchestratorState) -> dict[str, Any]:
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
+            # Use guardrail-wrapped sandbox proxy (VAL-GUARDRAIL-011)
+            sandbox_proxy = get_sandbox_proxy(task_id)
             qa_result: QARunResult = await _run_qa_agent(
                 code_edit=state.code_edit,
-                sandbox_manager=sandbox,
+                sandbox_manager=sandbox_proxy or sandbox,
                 episodic_store=store,
                 task_id=UUID(task_id) if task_id else None,
                 trace_id=trace_id,
@@ -898,6 +1021,19 @@ async def run_qa(state: OrchestratorState) -> dict[str, Any]:
             cached_tokens = qa_result.cached_tokens
             cost_usd = qa_result.cost_usd
 
+        except GuardrailViolation as gv:
+            # VAL-GUARDRAIL-007..009: report to Langfuse + outcomes + HITL
+            logger.warning(
+                "Guardrail violation in QA for task %s: %s",
+                task_id, gv.rule_name,
+            )
+            return await _handle_guardrail_violation(
+                violation=gv,
+                task_id=task_id,
+                trace_id=trace_id,
+                span_id=qa_span_id,
+                parent_span_id=supervisor_span_id,
+            )
         except Exception as exc:
             logger.error("QA agent failed for task %s: %s", task_id, exc)
             tracing.update_span(

@@ -481,9 +481,11 @@ class Orchestrator:
             if task.topology == "supervisor_only":
                 from src.orchestrator.supervisor_only import (
                     build_supervisor_only_graph,
+                    register_guardrail,
                     register_sandbox,
                     register_semantic_store,
                     register_store,
+                    unregister_guardrail,
                     unregister_sandbox,
                     unregister_semantic_store,
                     unregister_store,
@@ -491,9 +493,11 @@ class Orchestrator:
             else:
                 from src.orchestrator.hybrid import (
                     build_hybrid_graph,
+                    register_guardrail,
                     register_sandbox,
                     register_semantic_store,
                     register_store,
+                    unregister_guardrail,
                     unregister_sandbox,
                     unregister_semantic_store,
                     unregister_store,
@@ -525,6 +529,12 @@ class Orchestrator:
             # Register sandbox and store for node functions
             register_sandbox(task_id, sandbox)
             register_store(task_id, self.store)
+
+            # Create and register guardrail middleware (VAL-GUARDRAIL-001..011)
+            from src.guardrails.middleware import GuardrailMiddleware
+
+            guardrail = GuardrailMiddleware()
+            register_guardrail(task_id, guardrail)
 
             # Create and register semantic store for RAG retrieval
             from src.memory.semantic.store import SemanticStore
@@ -575,6 +585,7 @@ class Orchestrator:
                     await sandbox.teardown()
                 unregister_sandbox(task_id)
                 unregister_store(task_id)
+                unregister_guardrail(task_id)
                 ss = unregister_semantic_store(task_id)
                 if ss is not None:
                     with contextlib.suppress(Exception):
@@ -638,6 +649,7 @@ class Orchestrator:
                 await sandbox.teardown()
             unregister_sandbox(task_id)
             unregister_store(task_id)
+            unregister_guardrail(task_id)
             ss = unregister_semantic_store(task_id)
             if ss is not None:
                 with contextlib.suppress(Exception):

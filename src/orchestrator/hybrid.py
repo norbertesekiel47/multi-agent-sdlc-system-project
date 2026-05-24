@@ -62,6 +62,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph_swarm import create_handoff_tool, create_swarm  # noqa: F401
 
 from src.agents.models import CodeEdit, ReviewResult
+from src.guardrails.errors import GuardrailViolation
 from src.llm.cost import get_max_cost_per_task
 from src.orchestrator import OrchestratorState
 from src.orchestrator.supervisor_only import (
@@ -83,6 +84,15 @@ from src.orchestrator.supervisor_only import (
     run_supervisor_finalize,
 )
 from src.orchestrator.supervisor_only import (
+    _handle_guardrail_violation as _handle_guardrail_violation,
+)
+from src.orchestrator.supervisor_only import (
+    get_sandbox_proxy as get_sandbox_proxy,
+)
+from src.orchestrator.supervisor_only import (
+    register_guardrail as register_guardrail,
+)
+from src.orchestrator.supervisor_only import (
     register_sandbox as register_sandbox,
 )
 from src.orchestrator.supervisor_only import (
@@ -90,6 +100,9 @@ from src.orchestrator.supervisor_only import (
 )
 from src.orchestrator.supervisor_only import (
     register_store as register_store,
+)
+from src.orchestrator.supervisor_only import (
+    unregister_guardrail as unregister_guardrail,
 )
 from src.orchestrator.supervisor_only import (
     unregister_sandbox as unregister_sandbox,
@@ -287,6 +300,7 @@ async def run_reviewer_hybrid(state: OrchestratorState) -> dict[str, Any]:
                 task_id=UUID(task_id) if task_id else None,
                 trace_id=trace_id,
                 repo_url=state.repo_url,
+                sandbox_proxy=get_sandbox_proxy(task_id),
             )
             review = reviewer_result.review
             tokens_in = reviewer_result.tokens_in
@@ -474,10 +488,12 @@ async def run_peer_coder(state: OrchestratorState) -> dict[str, Any]:
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
+            # Use guardrail-wrapped sandbox proxy (VAL-GUARDRAIL-011)
+            sandbox_proxy = get_sandbox_proxy(task_id)
             coder_result: CoderRunResult = await _run_coder_agent(
                 change_plan=state.change_plan,
                 review_result=state.review_result,
-                sandbox_manager=sandbox,
+                sandbox_manager=sandbox_proxy or sandbox,
                 episodic_store=store,
                 task_id=UUID(task_id) if task_id else None,
                 trace_id=trace_id,
@@ -489,6 +505,19 @@ async def run_peer_coder(state: OrchestratorState) -> dict[str, Any]:
             cached_tokens = coder_result.cached_tokens
             cost_usd = coder_result.cost_usd
 
+        except GuardrailViolation as gv:
+            # VAL-GUARDRAIL-007..009
+            logger.warning(
+                "Guardrail violation in peer Coder for task %s: %s",
+                task_id, gv.rule_name,
+            )
+            return await _handle_guardrail_violation(
+                violation=gv,
+                task_id=task_id,
+                trace_id=trace_id,
+                span_id=coder_span_id,
+                parent_span_id=last_reviewer_span_id,
+            )
         except Exception as exc:
             logger.error("Peer Coder agent failed for task %s: %s", task_id, exc)
             tracing.update_span(
@@ -585,6 +614,7 @@ async def _run_reviewer_agent(
     task_id: UUID | None,
     trace_id: str,
     repo_url: str,
+    sandbox_proxy: Any | None = None,
 ) -> Any:
     """Run the Reviewer PydanticAI agent and return the result.
 
@@ -594,7 +624,7 @@ async def _run_reviewer_agent(
 
     return await _run_reviewer_agent(
         code_edit=code_edit,
-        sandbox_manager=sandbox,
+        sandbox_manager=sandbox_proxy or sandbox,
         episodic_store=store,
         task_id=task_id,
         trace_id=trace_id,
@@ -805,10 +835,12 @@ async def _run_coder_supervisor(state: OrchestratorState) -> dict[str, Any]:
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
+            # Use guardrail-wrapped sandbox proxy (VAL-GUARDRAIL-011)
+            sandbox_proxy = get_sandbox_proxy(task_id)
             coder_result: CoderRunResult = await _run_coder_agent(
                 change_plan=state.change_plan,
                 review_result=state.review_result,
-                sandbox_manager=sandbox,
+                sandbox_manager=sandbox_proxy or sandbox,
                 episodic_store=store,
                 task_id=UUID(task_id) if task_id else None,
                 trace_id=trace_id,
