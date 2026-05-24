@@ -10,8 +10,14 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from src.logging.secret_filter import install_secret_filter
+
 # Load environment variables from .env at import time (before any config reads).
 load_dotenv()
+
+# Install secret redaction filter on root logger so that PAT/API-key values
+# never appear in any log output or Langfuse span.
+install_secret_filter()
 
 __version__ = "0.1.0"
 
