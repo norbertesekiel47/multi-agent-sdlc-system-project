@@ -455,7 +455,9 @@ class TestCoderRespectsReviewResultFeedback:
     @pytest.mark.asyncio
     async def test_coder_run_with_review_builds_prompt(self) -> None:
         """run_coder includes ReviewResult in the prompt when provided."""
-        from src.agents.coder import CoderDeps, coder, run_coder
+        from decimal import Decimal
+
+        from src.agents.coder import CoderDeps, CoderRunResult, run_coder
 
         plan = _make_change_plan()
         review = _make_review_result()
@@ -467,22 +469,33 @@ class TestCoderRespectsReviewResultFeedback:
             trace_id="test-trace",
         )
 
-        mock_result = MagicMock()
-        mock_result.output = _make_code_edit()
+        mock_llm_result = MagicMock()
+        mock_llm_result.content = (
+            '```json\n'
+            '{"diff": "--- a/f.py\\n+++ b/f.py\\n@@ -1 +1 @@\\n-old\\n+new\\n",'
+            ' "touched_files": ["f.py"], "diff_hash": "abc123"}\n```'
+        )
+        mock_llm_result.usage_input = 1000
+        mock_llm_result.usage_output = 200
+        mock_llm_result.cached_tokens = 500
+        mock_llm_result.cost_usd = Decimal("0.01")
 
-        with patch.object(
-            coder, "run", new_callable=AsyncMock,
-        ) as mock_run, patch(
+        with patch(
+            "src.agents.coder.get_llm_client",
+        ) as mock_get_client, patch(
             "src.agents.coder.CoderDeps",
             return_value=deps_instance,
         ):
-            mock_run.return_value = mock_result
+            mock_client = AsyncMock()
+            mock_client.chat_with_cache.return_value = mock_llm_result
+            mock_get_client.return_value = mock_client
             result = await run_coder(
                 change_plan=plan,
                 review_result=review,
             )
 
-        assert isinstance(result, CodeEdit)
+        assert isinstance(result, CoderRunResult)
+        assert isinstance(result.edit, CodeEdit)
 
 
 # ── VAL-CODER-008: Coder cached_tokens reported ────────────────────

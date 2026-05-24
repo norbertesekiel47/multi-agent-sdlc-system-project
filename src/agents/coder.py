@@ -12,6 +12,12 @@ Tools:
 Prompt cache markers on static repo-context block (§2.10).
 Locked to deepseek/deepseek-chat-v3-0324 model ID (VAL-CODER-003).
 
+The ``run_coder`` function uses ``LLMClient.chat_with_cache()``
+with ``_build_coder_prompt()`` so that the StructuredPrompt
+with cache markers reaches OpenRouter.  Token counts (including
+cached_tokens) are extracted from the LLM response and returned
+via ``CoderRunResult`` for accumulation by the orchestrator.
+
 Architecture reference: §2.3 Specialized Agents.
 """
 
@@ -20,6 +26,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID, uuid4
 
@@ -29,6 +37,8 @@ from pydantic_ai import Agent, RunContext
 
 from src.agents.models import ChangePlan, CodeEdit, ReviewResult
 from src.llm.caching import StructuredPrompt, build_structured_prompt
+from src.llm.client import get_llm_client
+from src.llm.cost import estimate_cost_tiktoken
 from src.memory.episodic.models import CreateDecisionParams
 
 if TYPE_CHECKING:
@@ -37,6 +47,26 @@ if TYPE_CHECKING:
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+# ── Coder Run Result ───────────────────────────────────────────────
+
+
+@dataclass
+class CoderRunResult:
+    """Result of a Coder agent run, including token and cost metadata.
+
+    The orchestrator extracts ``tokens_in``, ``tokens_out``, and
+    ``cached_tokens`` from this result and accumulates them into
+    the task's ``total_tokens_in/out/cached`` state fields.
+    """
+
+    edit: CodeEdit
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cached_tokens: int = 0
+    cost_usd: Decimal = Decimal("0")
+
 
 # ── Model ID (VAL-CODER-003) ────────────────────────────────────
 # Locked to deepseek/deepseek-chat-v3-0324 via OpenRouter.
@@ -265,6 +295,30 @@ async def _rag_retrieval(ctx: RunContext[CoderDeps], query: str) -> str:
         return f"RAG retrieval error: {exc}"
 
 
+# ── JSON Parsing Helper ─────────────────────────────────────────────
+
+
+def _extract_json_from_response(content: str) -> dict[str, Any]:
+    """Extract JSON object from LLM response content.
+
+    The LLM may return JSON wrapped in markdown code fences.
+    This function strips fences and parses the JSON.
+    """
+    # Strip markdown code fences if present
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        # Remove opening fence (e.g. ```json or ```)
+        first_newline = stripped.index("\n") if "\n" in stripped else len(stripped)
+        stripped = stripped[first_newline + 1 :]
+        # Remove closing fence
+        if stripped.endswith("```"):
+            stripped = stripped[:-3]
+        stripped = stripped.strip()
+
+    result: dict[str, Any] = json.loads(stripped)
+    return result
+
+
 # ── Persistence Helper ─────────────────────────────────────────────
 
 
@@ -363,15 +417,22 @@ async def run_coder(
     trace_id: str = "",
     repo_url: str = "",
     repo_context: str = "",
-) -> CodeEdit:
+) -> CoderRunResult:
     """Run the Coder agent with a ChangePlan and optional ReviewResult.
 
     This is the primary entry point for the orchestrator. It:
-    1. Builds CoderDeps with the provided sandbox/retriever/store
-    2. Constructs the user prompt from ChangePlan + ReviewResult
-    3. Runs the Coder agent
-    4. Computes diff_hash if not already set
-    5. Persists the resulting CodeEdit as a decision row
+    1. Pre-reads relevant files from the sandbox (tool execution)
+    2. Pre-fetches RAG context if a retriever is available
+    3. Builds a structured prompt using ``_build_coder_prompt()``
+       with cache markers on the static (repo context) block
+    4. Calls ``LLMClient.chat_with_cache()`` so cache markers
+       reach OpenRouter (§2.10)
+    5. Parses the JSON response as ``CodeEdit``
+    6. Applies the diff to the sandbox
+    7. Computes diff_hash if not already set
+    8. Persists the resulting CodeEdit as a decision row
+    9. Returns ``CoderRunResult`` with token/cost metadata for
+       accumulation by the orchestrator
 
     Args:
         change_plan: The ChangePlan from the Planner.
@@ -385,25 +446,98 @@ async def run_coder(
         repo_context: Pre-fetched repo context string.
 
     Returns:
-        A Pydantic-valid CodeEdit with diff_hash computed.
+        A ``CoderRunResult`` containing the CodeEdit and token/cost metadata.
     """
     if task_id is None:
         task_id = uuid4()
 
-    deps = CoderDeps(
-        sandbox_manager=sandbox_manager,
-        rag_retriever=rag_retriever,
-        episodic_store=episodic_store,
-        task_id=task_id,
-        trace_id=trace_id,
-        repo_url=repo_url,
+    # ── Pre-read relevant files from sandbox ────────────────────
+    repo_context_parts: list[str] = []
+    if repo_context:
+        repo_context_parts.append(repo_context)
+
+    if sandbox_manager is not None:
+        for target_file in change_plan.target_files[:5]:
+            try:
+                content = await sandbox_manager.read_file(target_file)
+                repo_context_parts.append(
+                    f"### File: {target_file}\n```\n{content[:3000]}\n```"
+                )
+            except Exception:
+                pass
+
+    # ── Pre-fetch RAG context ──────────────────────────────────
+    if rag_retriever is not None:
+        try:
+            from src.memory.semantic.store import SemanticStore
+
+            if isinstance(rag_retriever, SemanticStore):
+                rag_results: list[dict[str, Any]] = await rag_retriever.retrieve_dicts(
+                    query=change_plan.rationale[:200],
+                    repo_url=repo_url,
+                    top_k=8,
+                )
+            else:
+                rag_results = await rag_retriever.retrieve(
+                    query=change_plan.rationale[:200],
+                    repo_url=repo_url,
+                    top_k=8,
+                )
+            for i, hit in enumerate(rag_results[:5], 1):
+                file_path = hit.get("file_path", "unknown")
+                chunk_text = hit.get("chunk_text", "")
+                repo_context_parts.append(
+                    f"[RAG {i}] {file_path}:\n{chunk_text[:1000]}"
+                )
+        except Exception as exc:
+            logger.warning("RAG retrieval failed in run_coder: %s", exc)
+
+    full_repo_context = "\n\n".join(repo_context_parts) if repo_context_parts else ""
+
+    # ── Build structured prompt with cache markers ──────────────
+    structured_prompt = _build_coder_prompt(
+        change_plan=change_plan,
+        review_result=review_result,
+        repo_context=full_repo_context,
     )
 
-    # Build the user prompt
-    user_prompt = _build_user_prompt(change_plan, review_result)
+    # ── Call LLM with cache markers via chat_with_cache ─────────
+    llm_client = get_llm_client()
+    llm_result = await llm_client.chat_with_cache(
+        structured_prompt=structured_prompt,
+        model=_CODER_MODEL,
+        task_id=str(task_id),
+        trace_id=trace_id,
+        agent_name="coder",
+        temperature=0.2,
+    )
 
-    result = await coder.run(user_prompt, deps=deps)
-    edit: CodeEdit = result.output
+    # ── Parse JSON response as CodeEdit ────────────────────────
+    try:
+        parsed = _extract_json_from_response(llm_result.content)
+        edit = CodeEdit.model_validate(parsed)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning(
+            "Coder LLM response could not be parsed as CodeEdit: %s. "
+            "Falling back to PydanticAI agent.run()",
+            exc,
+        )
+        # Fallback: use PydanticAI agent.run() with the dynamic block
+        deps = CoderDeps(
+            sandbox_manager=sandbox_manager,
+            rag_retriever=rag_retriever,
+            episodic_store=episodic_store,
+            task_id=task_id,
+            trace_id=trace_id,
+            repo_url=repo_url,
+        )
+        user_prompt = _build_user_prompt(change_plan, review_result)
+        result = await coder.run(user_prompt, deps=deps)
+        edit = result.output
+        # Extract usage from PydanticAI result if available
+        if hasattr(result, "usage") and result.usage:
+            llm_result.usage_input = getattr(result.usage, "request_tokens", 0) or 0
+            llm_result.usage_output = getattr(result.usage, "response_tokens", 0) or 0
 
     # Compute diff_hash if not already set (VAL-CODER-006)
     if not edit.diff_hash:
@@ -413,7 +547,15 @@ async def run_coder(
             diff_hash=_compute_diff_hash(edit.diff),
         )
 
-    # Persist the CodeEdit if a store is available
+    # ── Apply diff to sandbox ──────────────────────────────────
+    if sandbox_manager is not None:
+        try:
+            await sandbox_manager.apply_diff(edit.diff)
+            logger.info("Applied Coder diff to sandbox for task %s", task_id)
+        except Exception as exc:
+            logger.warning("Sandbox apply_diff failed: %s", exc)
+
+    # ── Persist the CodeEdit if a store is available ────────────
     if episodic_store is not None:
         await persist_code_edit(
             store=episodic_store,
@@ -422,7 +564,24 @@ async def run_coder(
             step_index=1,
         )
 
-    return edit
+    # ── Compute cost from token usage ──────────────────────────
+    cost_usd = (
+        llm_result.cost_usd
+        if llm_result.cost_usd > Decimal("0")
+        else estimate_cost_tiktoken(
+            model=_CODER_MODEL,
+            prompt_tokens=llm_result.usage_input,
+            completion_tokens=llm_result.usage_output,
+        )
+    )
+
+    return CoderRunResult(
+        edit=edit,
+        tokens_in=llm_result.usage_input,
+        tokens_out=llm_result.usage_output,
+        cached_tokens=llm_result.cached_tokens,
+        cost_usd=cost_usd,
+    )
 
 
 def _build_user_prompt(

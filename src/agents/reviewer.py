@@ -12,13 +12,22 @@ Tools:
 Same prompt cache markers as Coder (§2.10).
 Locked to deepseek/deepseek-chat-v3-0324 model ID (VAL-REVIEWER-008).
 
+The ``run_reviewer`` function uses ``LLMClient.chat_with_cache()``
+with ``_build_reviewer_prompt()`` so that the StructuredPrompt
+with cache markers reaches OpenRouter.  Token counts (including
+cached_tokens) are extracted from the LLM response and returned
+via ``ReviewerRunResult`` for accumulation by the orchestrator.
+
 Architecture reference: §2.3 Specialized Agents.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID, uuid4
 
@@ -28,6 +37,8 @@ from pydantic_ai import Agent, RunContext
 
 from src.agents.models import CodeEdit, ReviewResult
 from src.llm.caching import StructuredPrompt, build_structured_prompt
+from src.llm.client import get_llm_client
+from src.llm.cost import estimate_cost_tiktoken
 from src.memory.episodic.models import CreateDecisionParams
 
 if TYPE_CHECKING:
@@ -36,6 +47,26 @@ if TYPE_CHECKING:
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+# ── Reviewer Run Result ─────────────────────────────────────────────
+
+
+@dataclass
+class ReviewerRunResult:
+    """Result of a Reviewer agent run, including token and cost metadata.
+
+    The orchestrator extracts ``tokens_in``, ``tokens_out``, and
+    ``cached_tokens`` from this result and accumulates them into
+    the task's ``total_tokens_in/out/cached`` state fields.
+    """
+
+    review: ReviewResult
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cached_tokens: int = 0
+    cost_usd: Decimal = Decimal("0")
+
 
 # ── Model ID (VAL-REVIEWER-008) ──────────────────────────────────
 # Locked to deepseek/deepseek-chat-v3-0324 via OpenRouter.
@@ -271,6 +302,30 @@ async def _security_pattern_scan(
     return f"Security scan of {file_path}:\n" + "\n".join(findings)
 
 
+# ── JSON Parsing Helper ─────────────────────────────────────────────
+
+
+def _extract_json_from_response(content: str) -> dict[str, Any]:
+    """Extract JSON object from LLM response content.
+
+    The LLM may return JSON wrapped in markdown code fences.
+    This function strips fences and parses the JSON.
+    """
+    # Strip markdown code fences if present
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        # Remove opening fence (e.g. ```json or ```)
+        first_newline = stripped.index("\n") if "\n" in stripped else len(stripped)
+        stripped = stripped[first_newline + 1 :]
+        # Remove closing fence
+        if stripped.endswith("```"):
+            stripped = stripped[:-3]
+        stripped = stripped.strip()
+
+    result: dict[str, Any] = json.loads(stripped)
+    return result
+
+
 # ── Persistence Helper ─────────────────────────────────────────────
 
 
@@ -350,15 +405,22 @@ async def run_reviewer(
     trace_id: str = "",
     repo_url: str = "",
     repo_context: str = "",
-) -> ReviewResult:
+) -> ReviewerRunResult:
     """Run the Reviewer agent with a CodeEdit.
 
     This is the primary entry point for the orchestrator. It:
-    1. Builds ReviewerDeps with the provided sandbox/store
-    2. Constructs the user prompt from the CodeEdit
-    3. Runs the Reviewer agent
-    4. Sets diff_hash on the ReviewResult to match the CodeEdit
-    5. Persists the resulting ReviewResult as a decision row
+    1. Pre-reads modified files from the sandbox (tool execution)
+    2. Runs static analysis (ruff/mypy) in the sandbox
+    3. Runs security pattern scanning on touched files
+    4. Builds a structured prompt using ``_build_reviewer_prompt()``
+       with cache markers on the static (repo context) block
+    5. Calls ``LLMClient.chat_with_cache()`` so cache markers
+       reach OpenRouter (§2.10)
+    6. Parses the JSON response as ``ReviewResult``
+    7. Sets diff_hash to match the CodeEdit being reviewed
+    8. Persists the resulting ReviewResult as a decision row
+    9. Returns ``ReviewerRunResult`` with token/cost metadata for
+       accumulation by the orchestrator
 
     Args:
         code_edit: The CodeEdit to review.
@@ -370,24 +432,121 @@ async def run_reviewer(
         repo_context: Pre-fetched repo context string.
 
     Returns:
-        A Pydantic-valid ReviewResult with diff_hash matching the CodeEdit.
+        A ``ReviewerRunResult`` containing the ReviewResult and token/cost metadata.
     """
     if task_id is None:
         task_id = uuid4()
 
-    deps = ReviewerDeps(
-        sandbox_manager=sandbox_manager,
-        episodic_store=episodic_store,
-        task_id=task_id,
-        trace_id=trace_id,
-        repo_url=repo_url,
+    # ── Pre-read modified files from sandbox ────────────────────
+    repo_context_parts: list[str] = []
+    if repo_context:
+        repo_context_parts.append(repo_context)
+
+    if sandbox_manager is not None:
+        for touched_file in code_edit.touched_files[:5]:
+            try:
+                content = await sandbox_manager.read_file(touched_file)
+                repo_context_parts.append(
+                    f"### File: {touched_file}\n```\n{content[:3000]}\n```"
+                )
+            except Exception:
+                pass
+
+    # ── Run static analysis (ruff/mypy) ─────────────────────────
+    static_analysis_results: list[str] = []
+    if sandbox_manager is not None:
+        for touched_file in code_edit.touched_files[:3]:
+            try:
+                output = await sandbox_manager.run_command(
+                    f"ruff check {touched_file} 2>&1 || true"
+                )
+                if output.strip():
+                    static_analysis_results.append(
+                        f"Ruff check of {touched_file}:\n{output[:1000]}"
+                    )
+            except Exception:
+                pass
+            try:
+                output = await sandbox_manager.run_command(
+                    f"mypy {touched_file} 2>&1 || true"
+                )
+                if output.strip():
+                    static_analysis_results.append(
+                        f"Mypy check of {touched_file}:\n{output[:1000]}"
+                    )
+            except Exception:
+                pass
+
+    # ── Run security pattern scanning ───────────────────────────
+    security_results: list[str] = []
+    if sandbox_manager is not None:
+        for touched_file in code_edit.touched_files[:5]:
+            try:
+                file_content = await sandbox_manager.read_file(touched_file)
+                for pattern, description in _SECURITY_PATTERNS:
+                    matches = re.findall(pattern, file_content)
+                    if matches:
+                        security_results.append(
+                            f"⚠ {description} in {touched_file} "
+                            f"({len(matches)} occurrence(s))"
+                        )
+            except Exception:
+                pass
+
+    # Combine repo context with analysis results
+    if static_analysis_results:
+        repo_context_parts.append(
+            "## Static Analysis Results\n" + "\n".join(static_analysis_results)
+        )
+    if security_results:
+        repo_context_parts.append(
+            "## Security Scan Results\n" + "\n".join(security_results)
+        )
+
+    full_repo_context = "\n\n".join(repo_context_parts) if repo_context_parts else ""
+
+    # ── Build structured prompt with cache markers ──────────────
+    structured_prompt = _build_reviewer_prompt(
+        code_edit=code_edit,
+        repo_context=full_repo_context,
     )
 
-    # Build the user prompt
-    user_prompt = _build_user_prompt(code_edit)
+    # ── Call LLM with cache markers via chat_with_cache ─────────
+    llm_client = get_llm_client()
+    llm_result = await llm_client.chat_with_cache(
+        structured_prompt=structured_prompt,
+        model=_REVIEWER_MODEL,
+        task_id=str(task_id),
+        trace_id=trace_id,
+        agent_name="reviewer",
+        temperature=0.2,
+    )
 
-    result = await reviewer.run(user_prompt, deps=deps)
-    review: ReviewResult = result.output
+    # ── Parse JSON response as ReviewResult ─────────────────────
+    try:
+        parsed = _extract_json_from_response(llm_result.content)
+        review = ReviewResult.model_validate(parsed)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning(
+            "Reviewer LLM response could not be parsed as ReviewResult: %s. "
+            "Falling back to PydanticAI agent.run()",
+            exc,
+        )
+        # Fallback: use PydanticAI agent.run() with the dynamic block
+        deps = ReviewerDeps(
+            sandbox_manager=sandbox_manager,
+            episodic_store=episodic_store,
+            task_id=task_id,
+            trace_id=trace_id,
+            repo_url=repo_url,
+        )
+        user_prompt = _build_user_prompt(code_edit)
+        result = await reviewer.run(user_prompt, deps=deps)
+        review = result.output
+        # Extract usage from PydanticAI result if available
+        if hasattr(result, "usage") and result.usage:
+            llm_result.usage_input = getattr(result.usage, "request_tokens", 0) or 0
+            llm_result.usage_output = getattr(result.usage, "response_tokens", 0) or 0
 
     # Ensure diff_hash matches the CodeEdit being reviewed
     if not review.diff_hash and code_edit.diff_hash:
@@ -406,7 +565,24 @@ async def run_reviewer(
             step_index=2,
         )
 
-    return review
+    # ── Compute cost from token usage ──────────────────────────
+    cost_usd = (
+        llm_result.cost_usd
+        if llm_result.cost_usd > Decimal("0")
+        else estimate_cost_tiktoken(
+            model=_REVIEWER_MODEL,
+            prompt_tokens=llm_result.usage_input,
+            completion_tokens=llm_result.usage_output,
+        )
+    )
+
+    return ReviewerRunResult(
+        review=review,
+        tokens_in=llm_result.usage_input,
+        tokens_out=llm_result.usage_output,
+        cached_tokens=llm_result.cached_tokens,
+        cost_usd=cost_usd,
+    )
 
 
 def _build_user_prompt(code_edit: CodeEdit) -> str:

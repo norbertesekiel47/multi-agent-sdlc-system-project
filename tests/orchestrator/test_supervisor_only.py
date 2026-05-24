@@ -13,6 +13,13 @@ Feature expected behaviors:
   - No swarm/peer parent edges in trace (all routing goes through Supervisor)
   - Reviewer reject_with_changes triggers Supervisor to re-route to Coder
     (sequential, not peer)
+
+Additional coverage for m2-fix-caching-wiring:
+  - run_coder returns CoderRunResult with tokens_in, tokens_out, cached_tokens
+  - run_reviewer returns ReviewerRunResult with tokens_in, tokens_out, cached_tokens
+  - total_tokens_cached accumulates cached_tokens from each LLM call
+  - tokens_in/tokens_out are extracted from LLMCallResult (not hardcoded to 0)
+  - Tautological test assertions replaced with meaningful checks
 """
 
 from __future__ import annotations
@@ -21,11 +28,13 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from src.agents.coder import CoderRunResult
 from src.agents.models import (
     ChangePlan,
     CodeEdit,
     ReviewResult,
 )
+from src.agents.reviewer import ReviewerRunResult
 from src.orchestrator import OrchestratorState
 
 # Sample unified diff strings for testing (avoids line-too-long warnings)
@@ -514,10 +523,24 @@ class TestSupervisorOnlyGraphExecution:
             touched_files=["src/calculator.py"],
             diff_hash="abc123",
         )
+        mock_coder_result = CoderRunResult(
+            edit=mock_edit,
+            tokens_in=1500,
+            tokens_out=500,
+            cached_tokens=800,
+            cost_usd=Decimal("0.05"),
+        )
         mock_review = ReviewResult(
             verdict="accept",
             issues=[],
             diff_hash="abc123",
+        )
+        mock_reviewer_result = ReviewerRunResult(
+            review=mock_review,
+            tokens_in=2000,
+            tokens_out=300,
+            cached_tokens=1200,
+            cost_usd=Decimal("0.03"),
         )
 
         with ExitStack() as stack:
@@ -525,12 +548,12 @@ class TestSupervisorOnlyGraphExecution:
                 patch("src.agents.planner.run_planner", return_value=mock_plan)
             )
             stack.enter_context(
-                patch("src.agents.coder.run_coder", return_value=mock_edit)
+                patch("src.agents.coder.run_coder", return_value=mock_coder_result)
             )
             stack.enter_context(
                 patch(
                     "src.agents.reviewer.run_reviewer",
-                    return_value=mock_review,
+                    return_value=mock_reviewer_result,
                 )
             )
             for p in self._mock_infrastructure():
@@ -576,6 +599,20 @@ class TestSupervisorOnlyGraphExecution:
             touched_files=["src/calculator.py"],
             diff_hash="hash2",
         )
+        mock_coder_result_1 = CoderRunResult(
+            edit=mock_edit_1,
+            tokens_in=1500,
+            tokens_out=500,
+            cached_tokens=800,
+            cost_usd=Decimal("0.05"),
+        )
+        mock_coder_result_2 = CoderRunResult(
+            edit=mock_edit_2,
+            tokens_in=1800,
+            tokens_out=600,
+            cached_tokens=1000,
+            cost_usd=Decimal("0.06"),
+        )
         mock_review_reject = ReviewResult(
             verdict="reject_with_changes",
             issues=["Missing error handling"],
@@ -586,23 +623,37 @@ class TestSupervisorOnlyGraphExecution:
             issues=[],
             diff_hash="hash2",
         )
+        mock_reviewer_result_reject = ReviewerRunResult(
+            review=mock_review_reject,
+            tokens_in=2000,
+            tokens_out=300,
+            cached_tokens=1200,
+            cost_usd=Decimal("0.03"),
+        )
+        mock_reviewer_result_accept = ReviewerRunResult(
+            review=mock_review_accept,
+            tokens_in=2200,
+            tokens_out=350,
+            cached_tokens=1400,
+            cost_usd=Decimal("0.04"),
+        )
 
         coder_call_count = 0
 
-        async def mock_coder_fn(**kwargs: object) -> CodeEdit:
+        async def mock_coder_fn(**kwargs: object) -> CoderRunResult:
             nonlocal coder_call_count
             coder_call_count += 1
-            return mock_edit_1 if coder_call_count == 1 else mock_edit_2
+            return mock_coder_result_1 if coder_call_count == 1 else mock_coder_result_2
 
         reviewer_call_count = 0
 
-        async def mock_review_fn(**kwargs: object) -> ReviewResult:
+        async def mock_review_fn(**kwargs: object) -> ReviewerRunResult:
             nonlocal reviewer_call_count
             reviewer_call_count += 1
             return (
-                mock_review_reject
+                mock_reviewer_result_reject
                 if reviewer_call_count == 1
-                else mock_review_accept
+                else mock_reviewer_result_accept
             )
 
         with ExitStack() as stack:
@@ -658,10 +709,24 @@ class TestSupervisorOnlyGraphExecution:
             touched_files=["src/calculator.py"],
             diff_hash="hash1",
         )
+        mock_coder_result = CoderRunResult(
+            edit=mock_edit,
+            tokens_in=1500,
+            tokens_out=500,
+            cached_tokens=800,
+            cost_usd=Decimal("0.05"),
+        )
         mock_review = ReviewResult(
             verdict="reject",
             issues=["Fundamentally flawed approach"],
             diff_hash="hash1",
+        )
+        mock_reviewer_result = ReviewerRunResult(
+            review=mock_review,
+            tokens_in=2000,
+            tokens_out=300,
+            cached_tokens=1200,
+            cost_usd=Decimal("0.03"),
         )
 
         with ExitStack() as stack:
@@ -669,12 +734,12 @@ class TestSupervisorOnlyGraphExecution:
                 patch("src.agents.planner.run_planner", return_value=mock_plan)
             )
             stack.enter_context(
-                patch("src.agents.coder.run_coder", return_value=mock_edit)
+                patch("src.agents.coder.run_coder", return_value=mock_coder_result)
             )
             stack.enter_context(
                 patch(
                     "src.agents.reviewer.run_reviewer",
-                    return_value=mock_review,
+                    return_value=mock_reviewer_result,
                 )
             )
             for p in self._mock_infrastructure():
@@ -718,10 +783,24 @@ class TestSupervisorOnlyGraphExecution:
             touched_files=["src/calculator.py"],
             diff_hash="hash1",
         )
+        mock_coder_result = CoderRunResult(
+            edit=mock_edit,
+            tokens_in=1500,
+            tokens_out=500,
+            cached_tokens=800,
+            cost_usd=Decimal("0.05"),
+        )
         mock_review_reject = ReviewResult(
             verdict="reject_with_changes",
             issues=["Still not fixed"],
             diff_hash="hash1",
+        )
+        mock_reviewer_result = ReviewerRunResult(
+            review=mock_review_reject,
+            tokens_in=2000,
+            tokens_out=300,
+            cached_tokens=1200,
+            cost_usd=Decimal("0.03"),
         )
 
         with ExitStack() as stack:
@@ -729,12 +808,12 @@ class TestSupervisorOnlyGraphExecution:
                 patch("src.agents.planner.run_planner", return_value=mock_plan)
             )
             mock_coder = stack.enter_context(
-                patch("src.agents.coder.run_coder", return_value=mock_edit)
+                patch("src.agents.coder.run_coder", return_value=mock_coder_result)
             )
             stack.enter_context(
                 patch(
                     "src.agents.reviewer.run_reviewer",
-                    return_value=mock_review_reject,
+                    return_value=mock_reviewer_result,
                 )
             )
             for p in self._mock_infrastructure():
@@ -835,8 +914,8 @@ class TestSupervisorOnlySpanParentage:
         assert "supervisor_span_id" in reviewer_source
 
         # No agent should use another agent's span_id as parent
-        assert "planner_span_id" not in coder_source.replace("planner_span_id", "")
-        assert "coder_span_id" not in reviewer_source.replace("coder_span_id", "")
+        assert "planner_span_id" not in coder_source
+        assert "coder_span_id" not in reviewer_source
 
     def test_four_distinct_agent_names_in_trace(self) -> None:
         """VAL-TOPOLOGY-002: The trace contains 4 distinct agent names.
@@ -864,3 +943,304 @@ class TestSupervisorOnlySpanParentage:
         assert '"agent_name": "planner"' in planner_src
         assert '"agent_name": "coder"' in coder_src
         assert '"agent_name": "reviewer"' in reviewer_src
+
+
+class TestTokenExtractionAndCaching:
+    """Tests for m2-fix-caching-wiring: token extraction and
+    cached_tokens accumulation in supervisor_only orchestrator nodes.
+
+    These tests verify:
+    - run_coder returns CoderRunResult with tokens_in, tokens_out, cached_tokens
+    - run_reviewer returns ReviewerRunResult with tokens_in, tokens_out, cached_tokens
+    - total_tokens_cached accumulates cached_tokens from each LLM call
+    - tokens_in/tokens_out are extracted from LLMCallResult (not hardcoded to 0)
+    """
+
+    def test_coder_run_result_carries_token_metadata(self) -> None:
+        """CoderRunResult carries tokens_in, tokens_out, cached_tokens."""
+        edit = CodeEdit(
+            diff=_SAMPLE_DIFF,
+            touched_files=["src/calculator.py"],
+            diff_hash="abc123",
+        )
+        result = CoderRunResult(
+            edit=edit,
+            tokens_in=1500,
+            tokens_out=500,
+            cached_tokens=800,
+            cost_usd=Decimal("0.05"),
+        )
+        assert result.tokens_in == 1500
+        assert result.tokens_out == 500
+        assert result.cached_tokens == 800
+        assert result.cost_usd == Decimal("0.05")
+        assert result.edit.diff == _SAMPLE_DIFF
+
+    def test_reviewer_run_result_carries_token_metadata(self) -> None:
+        """ReviewerRunResult carries tokens_in, tokens_out, cached_tokens."""
+        review = ReviewResult(
+            verdict="accept",
+            issues=[],
+            diff_hash="abc123",
+        )
+        result = ReviewerRunResult(
+            review=review,
+            tokens_in=2000,
+            tokens_out=300,
+            cached_tokens=1200,
+            cost_usd=Decimal("0.03"),
+        )
+        assert result.tokens_in == 2000
+        assert result.tokens_out == 300
+        assert result.cached_tokens == 1200
+        assert result.cost_usd == Decimal("0.03")
+        assert result.review.verdict == "accept"
+
+    def test_state_has_total_tokens_cached_field(self) -> None:
+        """OrchestratorState has total_tokens_cached field for accumulation."""
+        state = OrchestratorState()
+        assert hasattr(state, "total_tokens_cached")
+        assert state.total_tokens_cached == 0
+
+    def test_total_tokens_cached_accumulates(self) -> None:
+        """total_tokens_cached accumulates across multiple agent calls."""
+        state = OrchestratorState(total_tokens_cached=0)
+        # Simulate accumulation from Coder + Reviewer
+        new_cached = state.total_tokens_cached + 800 + 1200
+        assert new_cached == 2000
+
+    @pytest.mark.asyncio
+    async def test_tokens_accumulated_in_accept_path(self) -> None:
+        """Tokens and cached_tokens are accumulated through the accept path."""
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        from src.orchestrator.supervisor_only import build_supervisor_only_graph
+
+        mock_plan = ChangePlan(
+            target_files=["src/calculator.py"],
+            rationale="The subtract function returns wrong results for negative inputs",
+            approach="Fix the subtraction logic",
+        )
+        mock_edit = CodeEdit(
+            diff=_SAMPLE_DIFF,
+            touched_files=["src/calculator.py"],
+            diff_hash="abc123",
+        )
+        mock_coder_result = CoderRunResult(
+            edit=mock_edit,
+            tokens_in=1500,
+            tokens_out=500,
+            cached_tokens=800,
+            cost_usd=Decimal("0.05"),
+        )
+        mock_review = ReviewResult(
+            verdict="accept",
+            issues=[],
+            diff_hash="abc123",
+        )
+        mock_reviewer_result = ReviewerRunResult(
+            review=mock_review,
+            tokens_in=2000,
+            tokens_out=300,
+            cached_tokens=1200,
+            cost_usd=Decimal("0.03"),
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("src.agents.planner.run_planner", return_value=mock_plan)
+            )
+            stack.enter_context(
+                patch("src.agents.coder.run_coder", return_value=mock_coder_result)
+            )
+            stack.enter_context(
+                patch(
+                    "src.agents.reviewer.run_reviewer",
+                    return_value=mock_reviewer_result,
+                )
+            )
+            for p in TestSupervisorOnlyGraphExecution._mock_infrastructure():
+                stack.enter_context(p)
+
+            graph = build_supervisor_only_graph()
+            compiled = graph.compile()
+
+            state = OrchestratorState(
+                task_id=str(uuid4()),
+                repo_url="https://github.com/org/repo",
+                issue_number=1,
+                issue_text="Bug: subtract returns wrong result",
+                topology="supervisor_only",
+            )
+
+            result = await compiled.ainvoke(state)
+            final = OrchestratorState.model_validate(result)
+
+            # Verify tokens_in/out are accumulated (not 0)
+            assert final.total_tokens_in > 0
+            assert final.total_tokens_out > 0
+            # Verify cached_tokens are accumulated
+            assert final.total_tokens_cached > 0
+            # Verify specific accumulated values
+            # Coder: 1500+2000=3500 tokens_in, 500+300=800 tokens_out
+            # cached: 800+1200=2000
+            assert final.total_tokens_in >= 3500
+            assert final.total_tokens_out >= 800
+            assert final.total_tokens_cached >= 2000
+
+    @pytest.mark.asyncio
+    async def test_cached_tokens_accumulate_across_retries(self) -> None:
+        """cached_tokens accumulate correctly across retry loops."""
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        from src.orchestrator.supervisor_only import build_supervisor_only_graph
+
+        mock_plan = ChangePlan(
+            target_files=["src/calculator.py"],
+            rationale="The subtract function returns wrong results",
+            approach="Fix the subtraction logic",
+        )
+        mock_edit_1 = CodeEdit(
+            diff=_SAMPLE_DIFF,
+            touched_files=["src/calculator.py"],
+            diff_hash="hash1",
+        )
+        mock_edit_2 = CodeEdit(
+            diff=_SAMPLE_DIFF_2,
+            touched_files=["src/calculator.py"],
+            diff_hash="hash2",
+        )
+        mock_coder_result_1 = CoderRunResult(
+            edit=mock_edit_1,
+            tokens_in=1500,
+            tokens_out=500,
+            cached_tokens=800,
+            cost_usd=Decimal("0.05"),
+        )
+        mock_coder_result_2 = CoderRunResult(
+            edit=mock_edit_2,
+            tokens_in=1800,
+            tokens_out=600,
+            cached_tokens=1000,
+            cost_usd=Decimal("0.06"),
+        )
+        mock_review_reject = ReviewResult(
+            verdict="reject_with_changes",
+            issues=["Missing error handling"],
+            diff_hash="hash1",
+        )
+        mock_review_accept = ReviewResult(
+            verdict="accept",
+            issues=[],
+            diff_hash="hash2",
+        )
+        mock_reviewer_result_reject = ReviewerRunResult(
+            review=mock_review_reject,
+            tokens_in=2000,
+            tokens_out=300,
+            cached_tokens=1200,
+            cost_usd=Decimal("0.03"),
+        )
+        mock_reviewer_result_accept = ReviewerRunResult(
+            review=mock_review_accept,
+            tokens_in=2200,
+            tokens_out=350,
+            cached_tokens=1400,
+            cost_usd=Decimal("0.04"),
+        )
+
+        coder_call_count = 0
+
+        async def mock_coder_fn(**kwargs: object) -> CoderRunResult:
+            nonlocal coder_call_count
+            coder_call_count += 1
+            return mock_coder_result_1 if coder_call_count == 1 else mock_coder_result_2
+
+        reviewer_call_count = 0
+
+        async def mock_review_fn(**kwargs: object) -> ReviewerRunResult:
+            nonlocal reviewer_call_count
+            reviewer_call_count += 1
+            return (
+                mock_reviewer_result_reject
+                if reviewer_call_count == 1
+                else mock_reviewer_result_accept
+            )
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("src.agents.planner.run_planner", return_value=mock_plan)
+            )
+            stack.enter_context(
+                patch("src.agents.coder.run_coder", side_effect=mock_coder_fn)
+            )
+            stack.enter_context(
+                patch(
+                    "src.agents.reviewer.run_reviewer",
+                    side_effect=mock_review_fn,
+                )
+            )
+            for p in TestSupervisorOnlyGraphExecution._mock_infrastructure():
+                stack.enter_context(p)
+
+            graph = build_supervisor_only_graph()
+            compiled = graph.compile()
+
+            state = OrchestratorState(
+                task_id=str(uuid4()),
+                repo_url="https://github.com/org/repo",
+                issue_number=1,
+                issue_text="Bug: subtract returns wrong result",
+                topology="supervisor_only",
+            )
+
+            result = await compiled.ainvoke(state)
+            final = OrchestratorState.model_validate(result)
+
+            # With 2 Coder calls + 2 Reviewer calls:
+            # cached_tokens: 800 + 1000 + 1200 + 1400 = 4400
+            assert final.total_tokens_cached >= 4400
+            # tokens_in: 1500 + 1800 + 2000 + 2200 = 7500
+            assert final.total_tokens_in >= 7500
+            # tokens_out: 500 + 600 + 300 + 350 = 1750
+            assert final.total_tokens_out >= 1750
+
+
+class TestTautologicalAssertions:
+    """Tests verifying the tautological assertion fix.
+
+    The original assertions were:
+        assert 'X' not in source.replace('X', '')
+    which always passes because .replace('X', '') removes all 'X'.
+
+    The fix changes them to:
+        assert 'X' not in source
+    which is a meaningful check that the string genuinely does not
+    contain the reference to another agent's span ID.
+    """
+
+    def test_coder_does_not_reference_planner_span(self) -> None:
+        """Coder source does not reference planner_span_id (no peer handoff)."""
+        import inspect
+
+        from src.orchestrator.supervisor_only import run_coder
+
+        source = inspect.getsource(run_coder)
+        # This is a meaningful assertion: the coder function should
+        # not reference the planner's span ID because there is no
+        # direct planner→coder peer edge in supervisor_only.
+        assert "planner_span_id" not in source
+
+    def test_reviewer_does_not_reference_coder_span(self) -> None:
+        """Reviewer source does not reference coder_span_id (no peer handoff)."""
+        import inspect
+
+        from src.orchestrator.supervisor_only import run_reviewer
+
+        source = inspect.getsource(run_reviewer)
+        # This is a meaningful assertion: the reviewer function should
+        # not reference the coder's span ID because there is no
+        # direct coder→reviewer peer edge in supervisor_only.
+        assert "coder_span_id" not in source

@@ -516,14 +516,16 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
     cost_usd = Decimal("0")
     tokens_in = 0
     tokens_out = 0
+    cached_tokens = 0
 
     if state.change_plan is not None:
         try:
+            from src.agents.coder import CoderRunResult
             from src.agents.coder import run_coder as _run_coder_agent
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
-            edit = await _run_coder_agent(
+            coder_result: CoderRunResult = await _run_coder_agent(
                 change_plan=state.change_plan,
                 review_result=state.review_result,
                 sandbox_manager=sandbox,
@@ -532,12 +534,11 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
                 trace_id=trace_id,
                 repo_url=state.repo_url,
             )
-
-            cost_usd = estimate_cost_tiktoken(
-                model="deepseek/deepseek-chat-v3-0324",
-                prompt_tokens=tokens_in,
-                completion_tokens=tokens_out,
-            )
+            edit = coder_result.edit
+            tokens_in = coder_result.tokens_in
+            tokens_out = coder_result.tokens_out
+            cached_tokens = coder_result.cached_tokens
+            cost_usd = coder_result.cost_usd
 
         except Exception as exc:
             logger.error("Coder agent failed for task %s: %s", task_id, exc)
@@ -573,6 +574,7 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
             "agent_name": "coder",
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
+            "cached_tokens": cached_tokens,
             "cost_usd": str(cost_usd),
         },
     )
@@ -588,7 +590,7 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         cost_usd=cost_usd,
-        metadata={"agent_name": "coder"},
+        metadata={"agent_name": "coder", "cached_tokens": cached_tokens},
     )
 
     # Increment retry counter
@@ -612,6 +614,7 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
         "total_cost_usd": new_total_cost,
         "total_tokens_in": state.total_tokens_in + tokens_in,
         "total_tokens_out": state.total_tokens_out + tokens_out,
+        "total_tokens_cached": state.total_tokens_cached + cached_tokens,
     }
 
 
@@ -664,14 +667,16 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
     cost_usd = Decimal("0")
     tokens_in = 0
     tokens_out = 0
+    cached_tokens = 0
 
     if state.code_edit is not None:
         try:
+            from src.agents.reviewer import ReviewerRunResult
             from src.agents.reviewer import run_reviewer as _run_reviewer_agent
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
-            review = await _run_reviewer_agent(
+            reviewer_result: ReviewerRunResult = await _run_reviewer_agent(
                 code_edit=state.code_edit,
                 sandbox_manager=sandbox,
                 episodic_store=store,
@@ -679,12 +684,11 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
                 trace_id=trace_id,
                 repo_url=state.repo_url,
             )
-
-            cost_usd = estimate_cost_tiktoken(
-                model="deepseek/deepseek-chat-v3-0324",
-                prompt_tokens=tokens_in,
-                completion_tokens=tokens_out,
-            )
+            review = reviewer_result.review
+            tokens_in = reviewer_result.tokens_in
+            tokens_out = reviewer_result.tokens_out
+            cached_tokens = reviewer_result.cached_tokens
+            cost_usd = reviewer_result.cost_usd
 
         except Exception as exc:
             logger.error("Reviewer agent failed for task %s: %s", task_id, exc)
@@ -720,6 +724,7 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
             "agent_name": "reviewer",
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
+            "cached_tokens": cached_tokens,
             "cost_usd": str(cost_usd),
             "verdict": review.verdict if review else None,
         },
@@ -736,7 +741,11 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         cost_usd=cost_usd,
-        metadata={"agent_name": "reviewer", "verdict": review.verdict if review else None},
+        metadata={
+            "agent_name": "reviewer",
+            "cached_tokens": cached_tokens,
+            "verdict": review.verdict if review else None,
+        },
     )
 
     new_total_cost = state.total_cost_usd + cost_usd
@@ -755,6 +764,7 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
         "total_cost_usd": new_total_cost,
         "total_tokens_in": state.total_tokens_in + tokens_in,
         "total_tokens_out": state.total_tokens_out + tokens_out,
+        "total_tokens_cached": state.total_tokens_cached + cached_tokens,
     }
 
 
