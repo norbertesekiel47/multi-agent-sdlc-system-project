@@ -14,6 +14,7 @@ import asyncpg
 from dotenv import load_dotenv
 
 from src.memory.episodic.schema import EPISODIC_SCHEMA_SQL
+from src.memory.semantic.schema import SEMANTIC_SCHEMA_SQL
 
 # Load environment variables from .env so DB credentials are available
 # when this script is run standalone (not via init.sh).
@@ -34,13 +35,15 @@ def _dsn() -> str:
 
 
 async def _init_schema() -> None:
-    """Create episodic tables if they don't exist."""
+    """Create episodic and semantic tables if they don't exist."""
     dsn = _dsn()
     logger.info("Connecting to Postgres at %s", dsn.split("@")[-1])
     conn = await asyncpg.connect(dsn)
     try:
         await conn.execute(EPISODIC_SCHEMA_SQL)
         logger.info("Episodic schema initialized successfully.")
+        await conn.execute(SEMANTIC_SCHEMA_SQL)
+        logger.info("Semantic schema initialized successfully.")
     finally:
         await conn.close()
 

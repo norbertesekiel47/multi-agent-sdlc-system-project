@@ -230,11 +230,23 @@ async def _rag_retrieval(ctx: RunContext[CoderDeps], query: str) -> str:
         return "RAG retrieval not available. Proceed without code search results."
 
     try:
-        results: list[dict[str, Any]] = await ctx.deps.rag_retriever.retrieve(
-            query=query,
-            repo_url=ctx.deps.repo_url,
-            top_k=8,
-        )
+        # Support both dict-based and RetrievalResult-based retrievers.
+        # SemanticStore has retrieve_dicts that returns list[dict],
+        # while mock retrievers use retrieve directly.
+        from src.memory.semantic.store import SemanticStore
+
+        if isinstance(ctx.deps.rag_retriever, SemanticStore):
+            results: list[dict[str, Any]] = await ctx.deps.rag_retriever.retrieve_dicts(
+                query=query,
+                repo_url=ctx.deps.repo_url,
+                top_k=8,
+            )
+        else:
+            results = await ctx.deps.rag_retriever.retrieve(
+                query=query,
+                repo_url=ctx.deps.repo_url,
+                top_k=8,
+            )
         if not results:
             return "No RAG results found for this query."
 

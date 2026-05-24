@@ -468,8 +468,10 @@ class Orchestrator:
             from src.orchestrator.supervisor_only import (
                 build_supervisor_only_graph,
                 register_sandbox,
+                register_semantic_store,
                 register_store,
                 unregister_sandbox,
+                unregister_semantic_store,
                 unregister_store,
             )
 
@@ -499,6 +501,14 @@ class Orchestrator:
             # Register sandbox and store for node functions
             register_sandbox(task_id, sandbox)
             register_store(task_id, self.store)
+
+            # Create and register semantic store for RAG retrieval
+            from src.memory.semantic.store import SemanticStore
+
+            semantic_store = SemanticStore()
+            await semantic_store.connect()
+            register_semantic_store(task_id, semantic_store)
+
             graph = build_supervisor_only_graph()
         elif task.topology == "single_agent":
             graph = build_single_agent_graph()
@@ -524,6 +534,10 @@ class Orchestrator:
                     await sandbox.teardown()
                 unregister_sandbox(task_id)
                 unregister_store(task_id)
+                ss = unregister_semantic_store(task_id)
+                if ss is not None:
+                    with contextlib.suppress(Exception):
+                        await ss.close()
             await self.store.finish_task(UUID(task_id), "failed")
             await self.store.create_outcome(
                 CreateOutcomeParams(
@@ -545,6 +559,10 @@ class Orchestrator:
                 await sandbox.teardown()
             unregister_sandbox(task_id)
             unregister_store(task_id)
+            ss = unregister_semantic_store(task_id)
+            if ss is not None:
+                with contextlib.suppress(Exception):
+                    await ss.close()
 
         # Flush Langfuse traces
         tracing = get_tracing_client()

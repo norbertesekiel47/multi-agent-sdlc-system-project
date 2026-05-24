@@ -94,8 +94,10 @@ def unregister_sandbox(task_id: str) -> None:
 # Same pattern as sandbox — store reference can't be serialized.
 
 from src.memory.episodic.store import EpisodicStore  # noqa: E402
+from src.memory.semantic.store import SemanticStore  # noqa: E402
 
 _active_stores: dict[str, EpisodicStore] = {}
+_active_semantic_stores: dict[str, SemanticStore] = {}
 
 
 def register_store(task_id: str, store: EpisodicStore) -> None:
@@ -111,6 +113,21 @@ def get_store(task_id: str) -> EpisodicStore | None:
 def unregister_store(task_id: str) -> None:
     """Remove an episodic store from the registry."""
     _active_stores.pop(task_id, None)
+
+
+def register_semantic_store(task_id: str, store: SemanticStore) -> None:
+    """Register a semantic store for a task."""
+    _active_semantic_stores[task_id] = store
+
+
+def get_semantic_store(task_id: str) -> SemanticStore | None:
+    """Look up the semantic store for a task."""
+    return _active_semantic_stores.get(task_id)
+
+
+def unregister_semantic_store(task_id: str) -> SemanticStore | None:
+    """Remove a semantic store from the registry and return it."""
+    return _active_semantic_stores.pop(task_id, None)
 
 
 # ── Routing functions ───────────────────────────────────────────────
@@ -311,9 +328,11 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
         from src.agents.planner import run_planner as _run_planner_agent
 
         store = get_store(task_id)
+        semantic_store = get_semantic_store(task_id)
         plan = await _run_planner_agent(
             issue_context=issue_context,
             episodic_store=store,
+            rag_retriever=semantic_store,
             task_id=UUID(task_id) if task_id else None,
             trace_id=trace_id,
         )
@@ -923,6 +942,104 @@ async def halt_retry_exhausted(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
+# ── Index Repo Node ─────────────────────────────────────────────────
+# Indexes the cloned repo into pgvector before the Planner runs.
+# VAL-RAG-008: Indexer runs on task intake before Planner.
+
+
+async def index_repo(state: OrchestratorState) -> dict[str, Any]:
+    """Node: Index the cloned repo into the pgvector semantic store.
+
+    Walks the cloned repo, filters by extension, chunks via
+    token-aware splitter, embeds via OpenAI text-embedding-3-small,
+    and writes rows to repo_chunks.
+
+    VAL-RAG-008: The indexer span must end before the first Planner
+    LLM completion span starts.
+
+    This node runs between run_supervisor and run_planner.
+    """
+    task_id = state.task_id
+    repo_url = state.repo_url
+
+    logger.info("Indexing repo for task %s: %s", task_id, repo_url)
+
+    # Get the sandbox (already provisioned by the Orchestrator)
+    sandbox = get_sandbox(task_id)
+    if sandbox is None:
+        logger.error("No sandbox found for task %s during indexing", task_id)
+        return {"errors": ["No sandbox available for indexing"]}
+
+    # Create Langfuse span for indexing
+    tracing = get_tracing_client()
+    trace_id = state.trace_id
+    supervisor_span_id = getattr(state, "supervisor_span_id", "") or ""
+
+    indexer_span_id = tracing.create_span(
+        trace_id=trace_id,
+        parent_span_id=supervisor_span_id or None,
+        name="indexer.embed",
+        span_type=SpanType.SPAN,
+        input_data={"repo_url": repo_url},
+        metadata={"task_id": task_id, "agent_name": "indexer"},
+        start_time=datetime.now(UTC),
+    )
+
+    await _emit_trace_event(
+        task_id=task_id,
+        trace_id=trace_id,
+        span_id=indexer_span_id or "",
+        parent_span_id=supervisor_span_id,
+        name="indexer.embed",
+        event_type="node_start",
+        metadata={"agent_name": "indexer"},
+    )
+
+    chunk_count = 0
+    try:
+        from src.memory.semantic.store import SemanticStore
+
+        # Use the registered semantic store if available, otherwise create one
+        semantic_store = get_semantic_store(task_id)
+        if semantic_store is None:
+            semantic_store = SemanticStore()
+            await semantic_store.connect()
+
+        chunk_count = await semantic_store.index_repo(
+            repo_url=repo_url,
+            repo_path=str(sandbox.workspace_dir),
+        )
+    except Exception as exc:
+        logger.warning("Indexing failed for task %s: %s", task_id, exc)
+        # Indexing failure is non-fatal — the Planner can still work
+        # without RAG hits, just with degraded context.
+
+    # Update indexer span end
+    tracing.update_span(
+        trace_id=trace_id,
+        span_id=indexer_span_id or "",
+        output_data={"chunk_count": chunk_count},
+        end_time=datetime.now(UTC),
+        metadata={"task_id": task_id, "chunk_count": chunk_count},
+    )
+
+    await _emit_trace_event(
+        task_id=task_id,
+        trace_id=trace_id,
+        span_id=indexer_span_id or "",
+        parent_span_id=supervisor_span_id,
+        name="indexer.embed",
+        event_type="node_end",
+        metadata={"agent_name": "indexer", "chunk_count": chunk_count},
+    )
+
+    logger.info(
+        "Indexing complete for task %s: %d chunks", task_id, chunk_count
+    )
+
+    return {"step_index": state.step_index}
+
+
 # ── Build the supervisor_only graph ────────────────────────────────
 
 
@@ -931,8 +1048,9 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
 
     The graph topology is::
 
-        START → run_supervisor → run_planner → route_after_planner →
-        run_coder → route_after_coder → run_reviewer → route_after_review
+        START → run_supervisor → index_repo → run_planner →
+        route_after_planner → run_coder → route_after_coder →
+        run_reviewer → route_after_review
         → (accept: run_supervisor_finalize → END) |
           (reject_with_changes: run_coder → ... loop) |
           (retry exhausted: halt_retry_exhausted → END)
@@ -942,11 +1060,14 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
 
     VAL-TOPOLOGY-003: No Coder→Reviewer peer handoff edges.  All
     routing decisions are made by the Supervisor (route_after_review).
+
+    VAL-RAG-008: index_repo runs before run_planner.
     """
     graph = StateGraph(OrchestratorState)
 
     # ── Add agent nodes ────────────────────────────────────────
     graph.add_node("run_supervisor", run_supervisor)
+    graph.add_node("index_repo", index_repo)
     graph.add_node("run_planner", run_planner)
     graph.add_node("run_coder", run_coder)
     graph.add_node("run_reviewer", run_reviewer)
@@ -958,8 +1079,11 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     # START → Supervisor
     graph.add_edge(START, "run_supervisor")
 
-    # Supervisor → Planner (always first agent)
-    graph.add_edge("run_supervisor", "run_planner")
+    # Supervisor → Index Repo (VAL-RAG-008: index before planner)
+    graph.add_edge("run_supervisor", "index_repo")
+
+    # Index Repo → Planner (sequential)
+    graph.add_edge("index_repo", "run_planner")
 
     # Planner → Coder (sequential)
     graph.add_edge("run_planner", "run_coder")
