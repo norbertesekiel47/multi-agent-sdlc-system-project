@@ -494,7 +494,7 @@ class SandboxManager:
             return False
         try:
             self._container.reload()
-            return self._container.status == "running"
+            return str(self._container.status) == "running"
         except docker.errors.NotFound:
             return False
 
@@ -503,7 +503,7 @@ class SandboxManager:
         """Return the sandbox container ID (or None if not running)."""
         if self._container is None:
             return None
-        return self._container.id
+        return str(self._container.id)
 
     # ── Static helpers ───────────────────────────────────
 

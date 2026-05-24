@@ -93,7 +93,7 @@ def _sync_sweep(max_age_seconds: int = JANITOR_MAX_AGE_SECONDS) -> int:
 
 
 def _container_created_timestamp(
-    container: docker.models.containers.Container,  # type: ignore[name-defined]
+    container: docker.models.containers.Container,
 ) -> float | None:
     """Extract the Unix timestamp from a container's Created field."""
     try:
