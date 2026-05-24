@@ -96,7 +96,7 @@ async def read_file(ctx: RunContext[SandboxTools], path: str) -> str:
         path: Relative path to the file (e.g. 'src/calculator.py')
     """
     try:
-        content = await ctx.deps.sandbox.read_file(path)
+        content: str = await ctx.deps.sandbox.read_file(path)
         return content
     except Exception as exc:
         return f"Error reading {path}: {exc}"
@@ -127,7 +127,7 @@ async def run_command(ctx: RunContext[SandboxTools], command: str) -> str:
         command: The shell command to execute
     """
     try:
-        output = await ctx.deps.sandbox.run_command(command)
+        output: str = await ctx.deps.sandbox.run_command(command)
         return output
     except Exception as exc:
         return f"Error running command: {exc}"
@@ -144,7 +144,7 @@ async def run_tests(
         test_command: The test command to run (default: pytest)
     """
     try:
-        output = await ctx.deps.sandbox.run_tests(test_command=test_command)
+        output: str = await ctx.deps.sandbox.run_tests(test_command=test_command)
         return output
     except Exception as exc:
         return f"Error running tests: {exc}"
@@ -175,7 +175,7 @@ async def list_files(
     """
     try:
         cmd = f"find {directory} -type f -not -path '*/.git/*' | head -50"
-        output = await ctx.deps.sandbox.run_command(cmd)
+        output: str = await ctx.deps.sandbox.run_command(cmd)
         return output
     except Exception as exc:
         return f"Error listing files: {exc}"

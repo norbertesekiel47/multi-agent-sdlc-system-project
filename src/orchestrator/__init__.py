@@ -368,7 +368,7 @@ async def run_single_agent_e2e(
 # ── Build the single_agent graph ────────────────────────────────────
 
 
-def build_single_agent_graph() -> StateGraph:
+def build_single_agent_graph() -> StateGraph:  # type: ignore[type-arg]
     """Build the LangGraph state machine for the single_agent topology.
 
     The graph is linear: START → run_single_agent_e2e → END
