@@ -68,3 +68,6 @@ warn_unused_configs = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-q --tb=short"
+markers = [
+    "sandbox_isolation: Tests that spin up real Docker containers for sandbox isolation verification",
+]

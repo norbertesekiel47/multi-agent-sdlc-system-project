@@ -1,0 +1,10 @@
+# SDLC-Swarm sandbox proxy allowlist
+# Only these domains are accessible from inside the sandbox container.
+# All other egress is blocked by the sidecar Squid proxy.
+
+allowlist:
+  - pypi.org
+  - files.pythonhosted.org
+  - registry.npmjs.org
+  - crates.io
+  - huggingface.co
