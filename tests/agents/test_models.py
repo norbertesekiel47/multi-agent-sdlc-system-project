@@ -1,8 +1,11 @@
 """Tests for agent models — typed IO validation.
 
 Verifies that Pydantic models enforce the correct constraints:
-- IssueContext requires non-empty fields
+- IssueContext requires non-empty fields and supports RAG/episodic fields
+- RAGHit validates file_path and chunk_text are non-empty
+- EpisodicFact validates fact_kind
 - ChangePlan requires non-empty target_files and rationale ≥ 20 chars
+- ChangePlan rejects whitespace-only rationale
 - CodeEdit requires non-empty diff and touched_files
 - TestReport requires non-negative passed/failed
 - ReviewResult verdict must be in the allowed set
@@ -16,11 +19,46 @@ from pydantic import ValidationError
 from src.agents.models import (
     ChangePlan,
     CodeEdit,
+    EpisodicFact,
     IssueContext,
+    RAGHit,
     ReviewResult,
     SingleAgentOutput,
     TestReport,
 )
+
+
+class TestRAGHit:
+    """Tests for RAGHit model validation."""
+
+    def test_valid_rag_hit(self) -> None:
+        hit = RAGHit(file_path="src/calculator.py", chunk_text="def add(a, b):", score=0.95)
+        assert hit.file_path == "src/calculator.py"
+        assert hit.score == 0.95
+
+    def test_empty_file_path_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            RAGHit(file_path="", chunk_text="some code", score=0.5)
+
+    def test_empty_chunk_text_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            RAGHit(file_path="src/main.py", chunk_text="", score=0.5)
+
+    def test_default_score(self) -> None:
+        hit = RAGHit(file_path="src/main.py", chunk_text="code")
+        assert hit.score == 0.0
+
+
+class TestEpisodicFact:
+    """Tests for EpisodicFact model validation."""
+
+    def test_valid_episodic_fact(self) -> None:
+        fact = EpisodicFact(fact_kind="language", fact_value={"value": "python"})
+        assert fact.fact_kind == "language"
+
+    def test_default_fact_value(self) -> None:
+        fact = EpisodicFact(fact_kind="test_command")
+        assert fact.fact_value == {}
 
 
 class TestIssueContext:
@@ -75,6 +113,32 @@ class TestIssueContext:
         )
         assert ctx.repo_files == {}
         assert ctx.repo_facts == []
+        assert ctx.rag_hits == []
+        assert ctx.episodic_facts == []
+        assert ctx.recent_decisions == []
+
+    def test_with_rag_hits(self) -> None:
+        ctx = IssueContext(
+            repo_url="https://github.com/org/repo",
+            issue_number=1,
+            issue_text="Bug",
+            rag_hits=[
+                RAGHit(file_path="src/main.py", chunk_text="def foo():", score=0.9),
+            ],
+        )
+        assert len(ctx.rag_hits) == 1
+        assert ctx.rag_hits[0].file_path == "src/main.py"
+
+    def test_with_episodic_facts(self) -> None:
+        ctx = IssueContext(
+            repo_url="https://github.com/org/repo",
+            issue_number=1,
+            issue_text="Bug",
+            episodic_facts=[
+                EpisodicFact(fact_kind="language", fact_value={"value": "python"}),
+            ],
+        )
+        assert len(ctx.episodic_facts) == 1
 
 
 class TestChangePlan:
@@ -108,6 +172,21 @@ class TestChangePlan:
             rationale="12345678901234567890",  # exactly 20
         )
         assert len(plan.rationale) == 20
+
+    def test_whitespace_rationale_rejected(self) -> None:
+        """VAL-PLANNER-007: whitespace-only rationale is rejected."""
+        with pytest.raises(ValidationError):
+            ChangePlan(
+                target_files=["src/main.py"],
+                rationale="                    ",  # 20 spaces
+            )
+
+    def test_estimated_complexity_default(self) -> None:
+        plan = ChangePlan(
+            target_files=["src/main.py"],
+            rationale="This is a change plan with enough rationale length",
+        )
+        assert plan.estimated_complexity == "medium"
 
 
 class TestCodeEdit:
@@ -152,6 +231,10 @@ class TestTestReport:
         report = TestReport(passed=10, failed=0, failed_test_names=[])
         assert report.failed == 0
         assert report.failed_test_names == []
+
+    def test_not_collected_by_pytest(self) -> None:
+        """TestReport has __test__ = False to prevent pytest collection."""
+        assert TestReport.__test__ is False
 
 
 class TestReviewResult:

@@ -6,13 +6,41 @@ Free-form text outside the typed schema is rejected.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+class RAGHit(BaseModel):
+    """A single RAG retrieval result from pgvector semantic store.
+
+    Each hit includes the file path, the chunk text, and the
+    similarity score.  Results are scoped by repo_url in the
+    retrieval query (VAL-PLANNER-003).
+    """
+
+    file_path: str = Field(..., min_length=1, description="Source file path")
+    chunk_text: str = Field(..., min_length=1, description="Chunk content")
+    score: float = Field(default=0.0, description="Cosine similarity score")
+
+
+class EpisodicFact(BaseModel):
+    """A single episodic fact from the repo_facts table.
+
+    Used by the Planner to incorporate prior knowledge about
+    the target repo (VAL-PLANNER-004).
+    """
+
+    fact_kind: str = Field(..., description="Category of the fact")
+    fact_value: dict[str, object] = Field(
+        default_factory=dict, description="Fact payload"
+    )
 
 
 class IssueContext(BaseModel):
-    """Input context for the single-agent (and Planner) topology.
+    """Input context for the Planner (and single-agent) topology.
 
-    Contains the issue text, repo metadata, and optional RAG/episodic hits.
+    Contains the issue text, repo metadata, RAG hits from pgvector,
+    and episodic memory hits from the repo_facts/decisions/outcomes
+    tables (VAL-PLANNER-003, VAL-PLANNER-004).
     """
 
     repo_url: str = Field(..., min_length=1, description="Canonical GitHub repo URL")
@@ -26,6 +54,18 @@ class IssueContext(BaseModel):
         default_factory=list,
         description="Episodic repo_facts for this repo_url",
     )
+    rag_hits: list[RAGHit] = Field(
+        default_factory=list,
+        description="RAG retrieval results from pgvector scoped to repo_url",
+    )
+    episodic_facts: list[EpisodicFact] = Field(
+        default_factory=list,
+        description="Episodic facts from repo_facts table for this repo_url",
+    )
+    recent_decisions: list[dict[str, object]] = Field(
+        default_factory=list,
+        description="Recent decisions for this repo_url from episodic store",
+    )
 
 
 class ChangePlan(BaseModel):
@@ -34,6 +74,10 @@ class ChangePlan(BaseModel):
     Architecturally equivalent to the Planner agent output (VAL-PLANNER-001),
     but used internally by the single_agent topology as a structured
     intermediate step.
+
+    The rationale field is validated to be at least 20 characters
+    (VAL-PLANNER-007).  Free-form text outside this schema is
+    rejected by the PydanticAI output parser (VAL-PLANNER-005).
     """
 
     target_files: list[str] = Field(
@@ -45,6 +89,19 @@ class ChangePlan(BaseModel):
     approach: str = Field(
         default="", description="Suggested implementation approach"
     )
+    estimated_complexity: str = Field(
+        default="medium",
+        description="Estimated complexity: low, medium, or high",
+    )
+
+    @field_validator("rationale")
+    @classmethod
+    def _rationale_not_whitespace(cls, v: str) -> str:
+        """Rationale must contain at least one non-whitespace character."""
+        if not v.strip():
+            msg = "Rationale must not be empty or whitespace-only"
+            raise ValueError(msg)
+        return v
 
 
 class CodeEdit(BaseModel):
@@ -67,6 +124,8 @@ class TestReport(BaseModel):
 
     Reports pass/fail counts, failed test names, and generated test files.
     """
+
+    __test__ = False  # Prevent pytest from trying to collect this as a test class
 
     passed: int = Field(..., ge=0, description="Number of passing tests")
     failed: int = Field(..., ge=0, description="Number of failing tests")
