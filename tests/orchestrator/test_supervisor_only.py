@@ -794,9 +794,16 @@ class TestSupervisorOnlyGraphExecution:
 
     @pytest.mark.asyncio
     async def test_retry_budget_exhausted_graph_execution(self) -> None:
-        """After 3 reject_with_changes, retry budget exhausted → failed."""
+        """After 3 reject_with_changes, retry budget exhausted → HITL interrupt.
+
+        VAL-RETRY-002: Third failure triggers escalation, not a fourth attempt.
+        VAL-RETRY-004: Retry exhaustion halts the task graph.
+        The halt_retry_exhausted node now triggers an HITL interrupt.
+        """
         from contextlib import ExitStack
         from unittest.mock import patch
+
+        from langgraph.checkpoint.memory import MemorySaver  # isort: split
 
         from src.orchestrator.supervisor_only import (
             _MAX_RETRIES_PER_STEP,
@@ -850,7 +857,8 @@ class TestSupervisorOnlyGraphExecution:
                 stack.enter_context(p)
 
             graph = build_supervisor_only_graph()
-            compiled = graph.compile()
+            checkpointer = MemorySaver()
+            compiled = graph.compile(checkpointer=checkpointer)
 
             state = OrchestratorState(
                 task_id=str(uuid4()),
@@ -860,12 +868,21 @@ class TestSupervisorOnlyGraphExecution:
                 topology="supervisor_only",
             )
 
-            result = await compiled.ainvoke(state)
-            final = OrchestratorState.model_validate(result)
+            thread_id = f"test-retry-{state.task_id}"
+            config = {"configurable": {"thread_id": thread_id}}
 
-            assert final.status == "failed"
-            assert final.outcome == "retry_budget_exhausted"
-            assert mock_coder.call_count == _MAX_RETRIES_PER_STEP
+            # Run the graph — it should hit the HITL interrupt
+            result = await compiled.ainvoke(state, config=config)
+
+            # The graph should be interrupted at hitl_retry_budget_exhausted
+            assert "__interrupt__" in result, (
+                f"Expected interrupt at retry_budget_exhausted, got: {result}"
+            )
+
+            # Verify coder was called exactly 3 times (no 4th attempt)
+            assert mock_coder.call_count == _MAX_RETRIES_PER_STEP, (
+                f"Expected {_MAX_RETRIES_PER_STEP} coder calls, got {mock_coder.call_count}"
+            )
 
 
 class TestSupervisorOnlySpanParentage:

@@ -100,6 +100,28 @@ class OrchestratorState(BaseModel):
     # HITL decision tracking (M4)
     hitl_decision: str = ""
 
+    # Failure-mode mitigations (M4 — §2.9)
+    # Loop detection: tool call history per agent (for sliding window)
+    # Maps agent_name → list of {"tool_name": str, "args_hash": str}
+    tool_call_history: dict[str, list[dict[str, str]]] = {}
+
+    # Uncertainty escalation: consecutive Pydantic failures per (agent, step)
+    # Maps "agent:step" → count
+    pydantic_fail_counters: dict[str, int] = {}
+
+    # Uncertainty escalation: consecutive test failure count
+    test_failure_count: int = 0
+
+    # Uncertainty escalation: rejected diff_hashes → count
+    rejected_diff_hashes: dict[str, int] = {}
+
+    # Uncertainty escalation: tool error windows per agent
+    # Maps agent_name → list of bool (True=success, False=error)
+    tool_error_windows: dict[str, list[bool]] = {}
+
+    # Whether an uncertainty trigger has already fired (first-wins)
+    uncertainty_fired: bool = False
+
     # Peer-handoff tracking (hybrid topology — M4)
     # Counts the number of Coder⇄Reviewer peer handoffs
     # (reject_with_changes loops via swarm edge, not through Supervisor)

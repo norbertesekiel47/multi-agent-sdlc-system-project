@@ -93,6 +93,12 @@ from src.orchestrator.supervisor_only import (
     hitl_guardrail_escalation as hitl_guardrail_escalation,
 )
 from src.orchestrator.supervisor_only import (
+    hitl_loop_detected as hitl_loop_detected,
+)
+from src.orchestrator.supervisor_only import (
+    hitl_uncertainty_escalation as hitl_uncertainty_escalation,
+)
+from src.orchestrator.supervisor_only import (
     register_guardrail as register_guardrail,
 )
 from src.orchestrator.supervisor_only import (
@@ -135,6 +141,8 @@ def route_after_review_hybrid(
     state: OrchestratorState,
 ) -> Literal[
     "hitl_guardrail_escalation",
+    "hitl_loop_detected",
+    "hitl_uncertainty_escalation",
     "run_qa",
     "run_peer_coder",
     "run_supervisor_finalize",
@@ -143,20 +151,19 @@ def route_after_review_hybrid(
     """After Reviewer, route based on verdict (hybrid topology).
 
     Same as supervisor_only's route_after_review EXCEPT:
-
-    - ``guardrail_block``: escalate to HITL (VAL-GUARDRAIL-009)
-    - ``accept``: advance to QA (same as supervisor_only)
     - ``reject_with_changes``: route to **run_peer_coder** (peer
       handoff via swarm edge, NOT through Supervisor).
-      VAL-TOPOLOGY-004: The Coder span's parent will be the Reviewer
-      span, creating a peer-handoff parent edge in the trace.
-    - ``reject``: advance to Supervisor finalize (same as supervisor_only)
-
-    When the retry budget is exhausted, halt with retry_budget_exhausted.
+    All other routing is the same.
     """
-    # VAL-GUARDRAIL-009: Check for guardrail violations first
+    # Check for guardrail violations first
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
+    # Check for loop detection
+    if state.outcome == "loop_detected":
+        return "hitl_loop_detected"
+    # Check for uncertainty escalation
+    if state.outcome == "uncertainty_escalation":
+        return "hitl_uncertainty_escalation"
 
     review = state.review_result
     if review is None:
@@ -207,13 +214,21 @@ def route_after_qa_hybrid(
     state: OrchestratorState,
 ) -> Literal[
     "hitl_guardrail_escalation",
+    "hitl_loop_detected",
+    "hitl_uncertainty_escalation",
     "run_supervisor_finalize",
     "halt_test_failure",
 ]:
     """After QA, route based on test results (same as supervisor_only)."""
-    # VAL-GUARDRAIL-009: Check for guardrail violations first
+    # Check for guardrail violations first
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
+    # Check for loop detection
+    if state.outcome == "loop_detected":
+        return "hitl_loop_detected"
+    # Check for uncertainty escalation
+    if state.outcome == "uncertainty_escalation":
+        return "hitl_uncertainty_escalation"
 
     report = state.test_report
     if report is None:
@@ -231,13 +246,19 @@ def route_after_qa_hybrid(
 
 def route_after_peer_coder(
     state: OrchestratorState,
-) -> Literal["hitl_guardrail_escalation", "run_reviewer"]:
-    """After peer Coder, route to guardrail escalation or Reviewer.
-
-    VAL-GUARDRAIL-009: If guardrail violation in peer Coder, escalate.
-    """
+) -> Literal[
+    "hitl_guardrail_escalation",
+    "hitl_loop_detected",
+    "hitl_uncertainty_escalation",
+    "run_reviewer",
+]:
+    """After peer Coder, route to guardrail/loop/uncertainty escalation or Reviewer."""
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
+    if state.outcome == "loop_detected":
+        return "hitl_loop_detected"
+    if state.outcome == "uncertainty_escalation":
+        return "hitl_uncertainty_escalation"
     return "run_reviewer"
 
 
@@ -726,6 +747,10 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
     # ── Guardrail escalation HITL node (VAL-GUARDRAIL-009) ────
     graph.add_node("hitl_guardrail_escalation", hitl_guardrail_escalation)
 
+    # ── Failure-mode HITL escalation nodes (§2.9) ──────────────
+    graph.add_node("hitl_loop_detected", hitl_loop_detected)
+    graph.add_node("hitl_uncertainty_escalation", hitl_uncertainty_escalation)
+
     # ── Add edges ───────────────────────────────────────────────
 
     # START → Supervisor
@@ -735,32 +760,38 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
     graph.add_edge("run_supervisor", "index_repo")
     graph.add_edge("index_repo", "run_planner")
 
-    # Planner → conditional routing (guardrail check + normal flow)
+    # Planner → conditional routing (guardrail + loop + uncertainty + normal flow)
     graph.add_conditional_edges(
         "run_planner",
         route_after_planner,
         {
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "hitl_loop_detected": "hitl_loop_detected",
+            "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
             "run_coder": "run_coder",
         },
     )
 
-    # Coder → conditional routing (guardrail check + normal flow)
+    # Coder → conditional routing (guardrail + loop + uncertainty + normal flow)
     graph.add_conditional_edges(
         "run_coder",
         route_after_coder,
         {
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "hitl_loop_detected": "hitl_loop_detected",
+            "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
             "run_reviewer": "run_reviewer",
         },
     )
 
-    # Reviewer → conditional routing (guardrail check + verdict routing)
+    # Reviewer → conditional routing (guardrail + loop + uncertainty + verdict routing)
     graph.add_conditional_edges(
         "run_reviewer",
         route_after_review_hybrid,
         {
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "hitl_loop_detected": "hitl_loop_detected",
+            "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
             "run_qa": "run_qa",  # accept → QA
             "run_peer_coder": "run_peer_coder",
             # reject_with_changes → peer Coder (VAL-TOPOLOGY-004)
@@ -776,16 +807,20 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
         route_after_peer_coder,
         {
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "hitl_loop_detected": "hitl_loop_detected",
+            "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
             "run_reviewer": "run_reviewer",
         },
     )
 
-    # QA → conditional routing (guardrail check + test results)
+    # QA → conditional routing (guardrail + loop + uncertainty + test results)
     graph.add_conditional_edges(
         "run_qa",
         route_after_qa_hybrid,
         {
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "hitl_loop_detected": "hitl_loop_detected",
+            "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
             "run_supervisor_finalize": "run_supervisor_finalize",
             "halt_test_failure": "halt_test_failure",
         },
@@ -808,6 +843,12 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
 
     # Guardrail escalation → END (after HITL decision resolved)
     graph.add_edge("hitl_guardrail_escalation", END)
+
+    # Loop detection HITL → END (VAL-LOOP-DETECT-004)
+    graph.add_edge("hitl_loop_detected", END)
+
+    # Uncertainty escalation HITL → END (VAL-UNCERTAINTY-007)
+    graph.add_edge("hitl_uncertainty_escalation", END)
 
     return graph
 

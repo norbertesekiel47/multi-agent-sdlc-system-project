@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import deque
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -314,34 +315,346 @@ async def hitl_guardrail_escalation(state: OrchestratorState) -> dict[str, Any]:
     return {"hitl_decision": "approve", "outcome": "", "status": "running"}
 
 
+# ── Loop detection HITL escalation node (VAL-LOOP-DETECT-004) ────
+
+
+async def hitl_loop_detected(state: OrchestratorState) -> dict[str, Any]:
+    """Node: HITL interrupt for loop detection escalation.
+
+    VAL-LOOP-DETECT-004: A ``loop_detected`` outcome triggers a
+    LangGraph ``interrupt()`` and surfaces a HITL escalation event
+    on the dashboard with cause ``loop_detected``.
+
+    VAL-CROSS-015: User can abort (reject), producing terminal outcome.
+    VAL-CROSS-016: User can provide guidance (approve with guidance).
+    """
+    task_id = state.task_id
+    logger.warning(
+        "Loop detection HITL interrupt for task %s", task_id,
+    )
+
+    # Update task status to awaiting_hitl
+    store = get_store(task_id)
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "awaiting_hitl")
+
+    # Broadcast HITL interrupt event for the dashboard
+    broadcaster = get_trace_broadcaster()
+    trace_id = getattr(state, "trace_id", "") or uuid4().hex
+
+    # Get loop detection context from errors
+    error_detail = "; ".join(state.errors) if state.errors else "Loop detected"
+
+    await broadcaster.publish(
+        TraceEvent(
+            type="hitl_interrupt",
+            task_id=task_id,
+            trace_id=trace_id,
+            span_id="",
+            parent_span_id="",
+            name="hitl_loop_detected",
+            span_type=SpanType.SPAN,
+            metadata={
+                "cause": "loop_detected",
+                "detail": error_detail,
+                "outcome": state.outcome,
+            },
+        )
+    )
+
+    # Fire the interrupt — graph pauses here
+    decision = interrupt({
+        "reason": "loop_detected",
+        "task_id": task_id,
+        "cause": "loop_detected",
+        "explanation": error_detail,
+    })
+
+    if decision == "reject" or decision is None:
+        # VAL-CROSS-015: Abort path — terminal outcome
+        if store is not None:
+            from src.memory.episodic.models import CreateOutcomeParams
+            await store.finish_task(UUID(task_id), "rejected", hitl_decision="reject")
+            await store.create_outcome(
+                CreateOutcomeParams(
+                    task_id=UUID(task_id),
+                    outcome="loop_detected",
+                    detail={"cause": "loop_detected", "aborted": True},
+                )
+            )
+        return {"outcome": "loop_detected", "status": "failed"}
+
+    # VAL-CROSS-016: Guidance path — resume with injected guidance
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "running")
+
+    return {"hitl_decision": "approve", "outcome": "", "status": "running"}
+
+
+# ── Uncertainty escalation HITL node (VAL-UNCERTAINTY-007) ────────
+
+
+async def hitl_uncertainty_escalation(state: OrchestratorState) -> dict[str, Any]:
+    """Node: HITL interrupt for uncertainty escalation.
+
+    VAL-UNCERTAINTY-007: Every ``uncertainty_escalation`` outcome
+    corresponds to a LangGraph ``interrupt()`` span, surfacing on
+    the dashboard HITL view.
+
+    The user can abort (reject) or provide guidance (approve).
+    """
+    task_id = state.task_id
+    logger.warning(
+        "Uncertainty escalation HITL interrupt for task %s", task_id,
+    )
+
+    # Update task status to awaiting_hitl
+    store = get_store(task_id)
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "awaiting_hitl")
+
+    # Broadcast HITL interrupt event for the dashboard
+    broadcaster = get_trace_broadcaster()
+    trace_id = getattr(state, "trace_id", "") or uuid4().hex
+
+    error_detail = "; ".join(state.errors) if state.errors else "Uncertainty escalation"
+
+    await broadcaster.publish(
+        TraceEvent(
+            type="hitl_interrupt",
+            task_id=task_id,
+            trace_id=trace_id,
+            span_id="",
+            parent_span_id="",
+            name="hitl_uncertainty_escalation",
+            span_type=SpanType.SPAN,
+            metadata={
+                "cause": "uncertainty_escalation",
+                "detail": error_detail,
+                "outcome": state.outcome,
+            },
+        )
+    )
+
+    # Fire the interrupt — graph pauses here
+    decision = interrupt({
+        "reason": "uncertainty_escalation",
+        "task_id": task_id,
+        "cause": "uncertainty_escalation",
+        "explanation": error_detail,
+    })
+
+    if decision == "reject" or decision is None:
+        # Abort — terminal outcome
+        if store is not None:
+            from src.memory.episodic.models import CreateOutcomeParams
+            await store.finish_task(UUID(task_id), "rejected", hitl_decision="reject")
+            await store.create_outcome(
+                CreateOutcomeParams(
+                    task_id=UUID(task_id),
+                    outcome="uncertainty_escalation",
+                    detail={"cause": "uncertainty_escalation", "aborted": True},
+                )
+            )
+        return {"outcome": "uncertainty_escalation", "status": "failed"}
+
+    # Guidance path — resume
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "running")
+
+    return {"hitl_decision": "approve", "outcome": "", "status": "running"}
+
+
+# ── Failure mode check helpers ──────────────────────────────────────
+
+
+async def _check_loop_detection(
+    *,
+    agent_name: str,
+    tool_name: str,
+    args: dict[str, Any],
+    state: OrchestratorState,
+    trace_id: str,
+    parent_span_id: str | None,
+) -> dict[str, Any] | None:
+    """Check if a tool call triggers loop detection.
+
+    Records the tool call in the sliding window and checks for
+    3 identical (tool_name, args_hash) in the last 5 calls.
+
+    Returns a state update dict with outcome='loop_detected' if
+    detected, or None if no loop.
+    """
+    from src.failure_modes.loop_detection import LoopDetector
+
+    # Reconstruct the detector from state
+    detector = LoopDetector(window_size=5, threshold=3)
+
+    # Replay existing tool call history for this agent
+    history = state.tool_call_history.get(agent_name, [])
+    for rec in history:
+        from src.failure_modes.loop_detection import ToolCallRecord
+        detector._windows.setdefault(agent_name, deque(maxlen=5))
+        detector._windows[agent_name].append(
+            ToolCallRecord(
+                tool_name=rec["tool_name"],
+                args_hash=rec["args_hash"],
+            )
+        )
+
+    # Record the new tool call
+    record = detector.record(agent_name, tool_name, args)
+
+    # Check for loop
+    result = detector.check(agent_name)
+
+    if result is not None:
+        # Loop detected — report to Langfuse
+        tracing = get_tracing_client()
+        span_id = tracing.create_span(
+            trace_id=trace_id,
+            parent_span_id=parent_span_id,
+            name="failure_mode.loop_detected",
+            span_type=SpanType.SPAN,
+            input_data={"tool_name": tool_name, "agent_name": agent_name},
+            output_data=result.to_outcome_data(),
+            metadata={
+                "failure_mode": "loop_detected",
+                "agent_name": agent_name,
+                "tool_name": tool_name,
+                "count": result.count,
+            },
+            start_time=datetime.now(UTC),
+            end_time=datetime.now(UTC),
+            level="ERROR",
+        )
+
+        # Broadcast
+        broadcaster = get_trace_broadcaster()
+        await broadcaster.publish(
+            TraceEvent(
+                type="failure_mode",
+                task_id=state.task_id,
+                trace_id=trace_id,
+                span_id=span_id or "",
+                parent_span_id=parent_span_id or "",
+                name="failure_mode.loop_detected",
+                span_type=SpanType.SPAN,
+                metadata=result.to_outcome_data()["detail"],
+            )
+        )
+
+        # Write outcome
+        store = get_store(state.task_id)
+        if store is not None:
+            from src.memory.episodic.models import CreateOutcomeParams
+            await store.create_outcome(
+                CreateOutcomeParams(
+                    task_id=UUID(state.task_id),
+                    outcome="loop_detected",
+                    detail=result.to_outcome_data()["detail"],
+                )
+            )
+
+        # Update tool call history in state
+        new_history = dict(state.tool_call_history)
+        agent_history = list(history)
+        agent_history.append({"tool_name": tool_name, "args_hash": record.args_hash})
+        # Trim to last 5
+        if len(agent_history) > 5:
+            agent_history = agent_history[-5:]
+        new_history[agent_name] = agent_history
+
+        return {
+            "errors": [f"Loop detected: {agent_name} called {tool_name} {result.count} times"],
+            "outcome": "loop_detected",
+            "status": "awaiting_hitl",
+            "tool_call_history": new_history,
+        }
+
+    # No loop — update tool call history and return None
+    new_history = dict(state.tool_call_history)
+    agent_history = list(history)
+    agent_history.append({"tool_name": tool_name, "args_hash": record.args_hash})
+    # Trim to last 5
+    if len(agent_history) > 5:
+        agent_history = agent_history[-5:]
+    new_history[agent_name] = agent_history
+
+    # Return just the history update (no outcome change)
+    # The caller should merge this into state
+    return None
+
+
+def _get_tool_call_history_update(
+    agent_name: str,
+    tool_name: str,
+    args: dict[str, Any],
+    state: OrchestratorState,
+) -> dict[str, list[dict[str, str]]]:
+    """Get the updated tool_call_history after recording a tool call.
+
+    This is a lightweight version that doesn't check for loops —
+    used when the loop detection check is done separately.
+    """
+    from src.failure_modes.loop_detection import compute_args_hash
+
+    args_hash = compute_args_hash(args)
+    new_history = dict(state.tool_call_history)
+    agent_history = list(new_history.get(agent_name, []))
+    agent_history.append({"tool_name": tool_name, "args_hash": args_hash})
+    # Keep only last 5 entries
+    if len(agent_history) > 5:
+        agent_history = agent_history[-5:]
+    new_history[agent_name] = agent_history
+    return new_history
+
+
 # ── Routing functions ───────────────────────────────────────────────
 
 
 def route_after_planner(
     state: OrchestratorState,
-) -> Literal["hitl_guardrail_escalation", "run_coder"]:
-    """After Planner, route to guardrail escalation or Coder.
+) -> Literal[
+    "hitl_guardrail_escalation",
+    "hitl_loop_detected",
+    "hitl_uncertainty_escalation",
+    "run_coder",
+]:
+    """After Planner, route to guardrail escalation, loop detection,
+    uncertainty escalation, or Coder.
 
-    VAL-GUARDRAIL-009: If a guardrail violation was detected in the
-    Planner's tool calls, route to the HITL escalation node instead
-    of continuing to Coder.
+    VAL-GUARDRAIL-009: If a guardrail violation was detected, route
+    to the HITL escalation node.
+    VAL-LOOP-DETECT-004: If loop was detected, route to HITL.
+    VAL-UNCERTAINTY-007: If uncertainty escalation, route to HITL.
     """
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
+    if state.outcome == "loop_detected":
+        return "hitl_loop_detected"
+    if state.outcome == "uncertainty_escalation":
+        return "hitl_uncertainty_escalation"
     return "run_coder"
 
 
 def route_after_coder(
     state: OrchestratorState,
-) -> Literal["hitl_guardrail_escalation", "run_reviewer"]:
-    """After Coder, route to guardrail escalation or Reviewer.
-
-    VAL-GUARDRAIL-009: If a guardrail violation was detected in the
-    Coder's tool calls (e.g. rm -rf outside sandbox), route to the
-    HITL escalation node instead of continuing to Reviewer.
+) -> Literal[
+    "hitl_guardrail_escalation",
+    "hitl_loop_detected",
+    "hitl_uncertainty_escalation",
+    "run_reviewer",
+]:
+    """After Coder, route to guardrail escalation, loop detection,
+    uncertainty escalation, or Reviewer.
     """
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
+    if state.outcome == "loop_detected":
+        return "hitl_loop_detected"
+    if state.outcome == "uncertainty_escalation":
+        return "hitl_uncertainty_escalation"
     return "run_reviewer"
 
 
@@ -349,6 +662,8 @@ def route_after_review(
     state: OrchestratorState,
 ) -> Literal[
     "hitl_guardrail_escalation",
+    "hitl_loop_detected",
+    "hitl_uncertainty_escalation",
     "run_qa",
     "run_coder",
     "run_supervisor_finalize",
@@ -357,6 +672,8 @@ def route_after_review(
     """After Reviewer, route based on verdict.
 
     - ``guardrail_block``: escalate to HITL (VAL-GUARDRAIL-009)
+    - ``loop_detected``: escalate to HITL (VAL-LOOP-DETECT-004)
+    - ``uncertainty_escalation``: escalate to HITL (VAL-UNCERTAINTY-007)
     - ``accept``: advance to QA (VAL-QA-001, VAL-QA-003)
     - ``reject_with_changes``: re-route to Coder (if retry budget
       allows), otherwise halt with retry_budget_exhausted
@@ -369,9 +686,16 @@ def route_after_review(
     VAL-REVIEWER-004: When ReviewResult.verdict == 'accept', the
     orchestrator routes to QA next, not back to Coder.
     """
-    # VAL-GUARDRAIL-009: Check for guardrail violations first
+    # Check for guardrail violations first
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
+    # Check for loop detection
+    if state.outcome == "loop_detected":
+        return "hitl_loop_detected"
+    # Check for uncertainty escalation
+    if state.outcome == "uncertainty_escalation":
+        return "hitl_uncertainty_escalation"
+
     review = state.review_result
     if review is None:
         # No review result — should not happen, advance to finalize
@@ -1013,12 +1337,16 @@ def route_after_qa(
     state: OrchestratorState,
 ) -> Literal[
     "hitl_guardrail_escalation",
+    "hitl_loop_detected",
+    "hitl_uncertainty_escalation",
     "run_supervisor_finalize",
     "halt_test_failure",
 ]:
     """After QA, route based on test results.
 
     - ``guardrail_block``: escalate to HITL (VAL-GUARDRAIL-009)
+    - ``loop_detected``: escalate to HITL (VAL-LOOP-DETECT-004)
+    - ``uncertainty_escalation``: escalate to HITL (VAL-UNCERTAINTY-007)
     - All pass (failed == 0): advance to Supervisor finalize (→ PR)
     - Failures (failed > 0): halt with test failure (VAL-QA-005)
 
@@ -1026,9 +1354,15 @@ def route_after_qa(
     NOT proceed to PR creation. It either retries (within budget)
     or escalates to HITL with cause persistent_test_failure.
     """
-    # VAL-GUARDRAIL-009: Check for guardrail violations first
+    # Check for guardrail violations first
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
+    # Check for loop detection
+    if state.outcome == "loop_detected":
+        return "hitl_loop_detected"
+    # Check for uncertainty escalation
+    if state.outcome == "uncertainty_escalation":
+        return "hitl_uncertainty_escalation"
 
     report = state.test_report
     if report is None:
@@ -1230,8 +1564,10 @@ async def halt_test_failure(state: OrchestratorState) -> dict[str, Any]:
 
     When TestReport.failed > 0, the orchestrator does NOT open a PR.
     Writes an outcome row and marks the task as failed.
-    In M4, this will trigger an HITL interrupt with cause
-    persistent_test_failure.
+
+    VAL-UNCERTAINTY-002: When persistent_test_failure trigger fires
+    (3 consecutive failures), outcome becomes uncertainty_escalation
+    instead of persistent_test_failure.
     """
     task_id = state.task_id
     report = state.test_report
@@ -1242,6 +1578,73 @@ async def halt_test_failure(state: OrchestratorState) -> dict[str, Any]:
         report.passed if report else 0,
         report.failed if report else 0,
     )
+
+    # Check for uncertainty escalation: persistent test failure
+    # Track test failure in state
+    new_test_failure_count = state.test_failure_count + 1
+
+    # Check if this triggers persistent_test_failure (3 consecutive)
+    from src.failure_modes.uncertainty import _PERSISTENT_TEST_FAILURE_THRESHOLD
+
+    if new_test_failure_count >= _PERSISTENT_TEST_FAILURE_THRESHOLD and not state.uncertainty_fired:
+        # Persistent test failure → uncertainty escalation
+        logger.warning(
+            "Uncertainty escalation: persistent_test_failure for task %s (count=%d)",
+            task_id, new_test_failure_count,
+        )
+
+        # Update supervisor span end with escalation
+        trace_id = getattr(state, "trace_id", "") or uuid4().hex
+        supervisor_span_id = getattr(state, "supervisor_span_id", "") or ""
+        tracing = get_tracing_client()
+        tracing.update_span(
+            trace_id=trace_id,
+            span_id=supervisor_span_id,
+            output_data={
+                "outcome": "uncertainty_escalation",
+                "trigger": "persistent_test_failure",
+                "failed_test_names": report.failed_test_names if report else [],
+            },
+            end_time=datetime.now(UTC),
+            level="ERROR",
+        )
+        await _emit_trace_event(
+            task_id=task_id,
+            trace_id=trace_id,
+            span_id=supervisor_span_id,
+            parent_span_id=None,
+            name="supervisor",
+            event_type="node_end",
+            metadata={
+                "agent_name": "supervisor",
+                "outcome": "uncertainty_escalation",
+                "trigger": "persistent_test_failure",
+            },
+        )
+
+        # Write outcome row
+        store = get_store(task_id)
+        if store is not None:
+            from src.memory.episodic.models import CreateOutcomeParams
+            await store.create_outcome(
+                CreateOutcomeParams(
+                    task_id=UUID(task_id),
+                    outcome="uncertainty_escalation",
+                    detail={
+                        "trigger": "persistent_test_failure",
+                        "consecutive_failures": new_test_failure_count,
+                        "failed_test_names": report.failed_test_names if report else [],
+                    },
+                )
+            )
+            await store.update_task_status(UUID(task_id), "awaiting_hitl")
+
+        return {
+            "outcome": "uncertainty_escalation",
+            "status": "awaiting_hitl",
+            "test_failure_count": new_test_failure_count,
+            "uncertainty_fired": True,
+        }
 
     # Update supervisor span end with failure
     trace_id = getattr(state, "trace_id", "") or uuid4().hex
@@ -1274,6 +1677,7 @@ async def halt_test_failure(state: OrchestratorState) -> dict[str, Any]:
     return {
         "outcome": "persistent_test_failure",
         "status": "failed",
+        "test_failure_count": new_test_failure_count,
     }
 
 
@@ -1628,8 +2032,10 @@ async def run_open_pr(state: OrchestratorState) -> dict[str, Any]:
 async def halt_retry_exhausted(state: OrchestratorState) -> dict[str, Any]:
     """Node: Halt the task because the retry budget is exhausted.
 
-    Writes an outcome row and marks the task as failed.
-    In M4, this will also trigger an HITL interrupt.
+    VAL-RETRY-002: Third failure triggers escalation, not a fourth attempt.
+    VAL-RETRY-004: After retry_budget_exhausted is emitted, no further
+    agent spans appear in the trace until HITL resolution.
+    Writes an outcome row and triggers HITL interrupt.
     """
     task_id = state.task_id
     logger.warning(
@@ -1658,9 +2064,65 @@ async def halt_retry_exhausted(state: OrchestratorState) -> dict[str, Any]:
         metadata={"agent_name": "supervisor", "outcome": "retry_budget_exhausted"},
     )
 
+    # Write outcome row
+    store = get_store(task_id)
+    if store is not None:
+        from src.memory.episodic.models import CreateOutcomeParams
+        await store.create_outcome(
+            CreateOutcomeParams(
+                task_id=UUID(task_id),
+                outcome="retry_budget_exhausted",
+                detail={
+                    "step_index": state.step_index,
+                    "retry_counters": state.retry_counters,
+                },
+            )
+        )
+        # Update task status to awaiting_hitl
+        await store.update_task_status(UUID(task_id), "awaiting_hitl")
+
+    # Broadcast HITL interrupt event
+    broadcaster = get_trace_broadcaster()
+    await broadcaster.publish(
+        TraceEvent(
+            type="hitl_interrupt",
+            task_id=task_id,
+            trace_id=trace_id,
+            span_id="",
+            parent_span_id="",
+            name="hitl_retry_budget_exhausted",
+            span_type=SpanType.SPAN,
+            metadata={
+                "cause": "retry_budget_exhausted",
+                "detail": f"Retry budget exhausted at step {state.step_index}",
+                "outcome": "retry_budget_exhausted",
+            },
+        )
+    )
+
+    # Fire the interrupt — graph pauses here for HITL
+    decision = interrupt({
+        "reason": "retry_budget_exhausted",
+        "task_id": task_id,
+        "cause": "retry_budget_exhausted",
+        "explanation": f"Retry budget exhausted at step {state.step_index}",
+    })
+
+    if decision == "reject" or decision is None:
+        # Rejected — end the task
+        if store is not None:
+            await store.finish_task(UUID(task_id), "rejected", hitl_decision="reject")
+        return {"outcome": "retry_budget_exhausted", "status": "failed"}
+
+    # Approved — resume with reset retry budget
+    if store is not None:
+        await store.update_task_status(UUID(task_id), "running")
+
     return {
-        "outcome": "retry_budget_exhausted",
-        "status": "failed",
+        "hitl_decision": "approve",
+        "outcome": "",
+        "status": "running",
+        "retry_counters": {},  # Reset all retry counters
     }
 
 
@@ -1768,7 +2230,7 @@ async def index_repo(state: OrchestratorState) -> dict[str, Any]:
 def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     """Build the LangGraph state machine for the supervisor_only topology.
 
-    The graph topology is::
+    The graph topology includes failure-mode mitigation nodes (§2.9):
 
         START → run_supervisor → index_repo → run_planner →
         route_after_planner → run_coder → route_after_coder →
@@ -1778,10 +2240,12 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
               hitl_pre_commit_push (if BEFORE_WRITE_OPS) →
               hitl_pre_pr →
               run_commit_and_push → run_open_pr → END) |
-            (failures: halt_test_failure → END)) |
+            (failures: halt_test_failure → END or uncertainty_escalation)) |
           (reject_with_changes: run_coder → ... loop) |
           (reject: run_supervisor_finalize → END) |
-          (retry exhausted: halt_retry_exhausted → END)
+          (retry exhausted: halt_retry_exhausted → HITL) |
+          (loop_detected: hitl_loop_detected → HITL) |
+          (uncertainty_escalation: hitl_uncertainty_escalation → HITL)
 
     VAL-TOPOLOGY-002: The agent span first-occurrence order is
     exactly [planner, coder, reviewer, qa] under the Supervisor parent.
@@ -1797,6 +2261,10 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     VAL-HITL-CTRL-001: interrupt() fires before PR open on every task.
     VAL-HITL-CTRL-002: BEFORE_WRITE_OPS=true → interrupt before every write.
     VAL-HITL-CTRL-003: BEFORE_WRITE_OPS=false → interrupt only before PR.
+
+    VAL-RETRY-002: Retry exhaustion triggers HITL interrupt.
+    VAL-LOOP-DETECT-004: Loop detection triggers HITL interrupt.
+    VAL-UNCERTAINTY-007: Uncertainty escalation triggers HITL interrupt.
     """
     from src.orchestrator.hitl import is_before_write_ops
 
@@ -1822,6 +2290,10 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     # ── Guardrail escalation HITL node (VAL-GUARDRAIL-009) ────
     graph.add_node("hitl_guardrail_escalation", hitl_guardrail_escalation)
 
+    # ── Failure-mode HITL escalation nodes (§2.9) ──────────────
+    graph.add_node("hitl_loop_detected", hitl_loop_detected)
+    graph.add_node("hitl_uncertainty_escalation", hitl_uncertainty_escalation)
+
     # ── Add edges ───────────────────────────────────────────────
 
     # START → Supervisor
@@ -1833,33 +2305,38 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     # Index Repo → Planner (sequential)
     graph.add_edge("index_repo", "run_planner")
 
-    # Planner → conditional routing (guardrail check + normal flow)
-    # VAL-GUARDRAIL-009: If guardrail violation, route to escalation
+    # Planner → conditional routing (guardrail + loop + uncertainty + normal flow)
     graph.add_conditional_edges(
         "run_planner",
         route_after_planner,
         {
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "hitl_loop_detected": "hitl_loop_detected",
+            "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
             "run_coder": "run_coder",
         },
     )
 
-    # Coder → conditional routing (guardrail check + normal flow)
+    # Coder → conditional routing (guardrail + loop + uncertainty + normal flow)
     graph.add_conditional_edges(
         "run_coder",
         route_after_coder,
         {
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "hitl_loop_detected": "hitl_loop_detected",
+            "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
             "run_reviewer": "run_reviewer",
         },
     )
 
-    # Reviewer → conditional routing (guardrail check + verdict routing)
+    # Reviewer → conditional routing (guardrail + loop + uncertainty + verdict routing)
     graph.add_conditional_edges(
         "run_reviewer",
         route_after_review,
         {
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "hitl_loop_detected": "hitl_loop_detected",
+            "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
             "run_qa": "run_qa",  # accept → QA (VAL-REVIEWER-004)
             "run_coder": "run_coder",  # reject_with_changes loop
             "run_supervisor_finalize": "run_supervisor_finalize",  # reject
@@ -1867,14 +2344,16 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         },
     )
 
-    # QA → conditional routing (guardrail check + test results)
+    # QA → conditional routing (guardrail + loop + uncertainty + test results)
     graph.add_conditional_edges(
         "run_qa",
         route_after_qa,
         {
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
+            "hitl_loop_detected": "hitl_loop_detected",
+            "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
             "run_supervisor_finalize": "run_supervisor_finalize",  # all pass → HITL + PR
-            "halt_test_failure": "halt_test_failure",  # test failures → halt
+            "halt_test_failure": "halt_test_failure",  # test failures → halt/escalation
         },
     )
 
@@ -1896,19 +2375,19 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     graph.add_edge("run_commit_and_push", "run_open_pr")
     graph.add_edge("run_open_pr", END)
 
-    # Supervisor finalize (reject path) → END
-    # Note: reject is handled INSIDE run_supervisor_finalize,
-    # which returns status="failed" and the graph ends.
-    # But for the accept path, finalize returns status="pre_hitl"
-    # and the graph continues through the HITL path above.
-
-    # Halt retry exhausted → END
+    # Halt retry exhausted → END (VAL-RETRY-002: now triggers HITL)
     graph.add_edge("halt_retry_exhausted", END)
 
-    # Halt test failure → END (VAL-QA-005)
+    # Halt test failure → END (VAL-QA-005; may produce uncertainty_escalation)
     graph.add_edge("halt_test_failure", END)
 
     # Guardrail escalation → END (after HITL decision resolved)
     graph.add_edge("hitl_guardrail_escalation", END)
+
+    # Loop detection HITL → END (VAL-LOOP-DETECT-004)
+    graph.add_edge("hitl_loop_detected", END)
+
+    # Uncertainty escalation HITL → END (VAL-UNCERTAINTY-007)
+    graph.add_edge("hitl_uncertainty_escalation", END)
 
     return graph
