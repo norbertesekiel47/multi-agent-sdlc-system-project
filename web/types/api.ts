@@ -45,6 +45,13 @@ export interface TaskDetail {
   ended_at: string | null;
   /** Historical trace events for backfill on page load / reconnect */
   trace_history?: TraceEvent[] | null;
+  /** HITL enrichment fields — populated when task is/was in HITL state */
+  pending_diff: string | null;
+  hitl_cause: string | null;
+  hitl_cause_detail: Record<string, unknown> | null;
+  review_summary: string | null;
+  test_summary: string | null;
+  reject_reason: string | null;
 }
 
 export interface ListTasksResponse {

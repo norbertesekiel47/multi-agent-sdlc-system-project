@@ -307,6 +307,15 @@ class EpisodicStore:
         assert row is not None, "INSERT RETURNING * should always produce a row"
         return self._decision_row_from_record(row)
 
+    async def get_decisions_for_task(self, task_id: UUID) -> list[DecisionRow]:
+        """Return all decisions for a given task, ordered by step_index."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM decisions WHERE task_id = $1 ORDER BY step_index, created_at",
+                task_id,
+            )
+        return [self._decision_row_from_record(r) for r in rows]
+
     async def query_recent_decisions(
         self,
         repo_url: str,

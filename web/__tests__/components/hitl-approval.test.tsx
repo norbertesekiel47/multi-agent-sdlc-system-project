@@ -51,6 +51,12 @@ const awaitingHitlTask = {
   pr_url: null,
   started_at: "2026-05-24T10:00:00Z",
   ended_at: null,
+  pending_diff: null,
+  hitl_cause: null,
+  hitl_cause_detail: null,
+  review_summary: null,
+  test_summary: null,
+  reject_reason: null,
 };
 
 describe("HitlApproval", () => {

@@ -88,6 +88,13 @@ class TaskDetailResponse(BaseModel):
     pr_url: str | None = None
     started_at: datetime
     ended_at: datetime | None = None
+    # HITL enrichment fields — populated when status is awaiting_hitl
+    pending_diff: str | None = None
+    hitl_cause: str | None = None
+    hitl_cause_detail: dict[str, object] | None = None
+    review_summary: str | None = None
+    test_summary: str | None = None
+    reject_reason: str | None = None
 
 
 class TaskListItemResponse(BaseModel):

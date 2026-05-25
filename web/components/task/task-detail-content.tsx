@@ -86,7 +86,7 @@ export function TaskDetailContent({
       </div>
 
       {/* Diff viewer */}
-      <DiffViewer />
+      <DiffViewer diff={task.pending_diff} />
     </div>
   );
 }

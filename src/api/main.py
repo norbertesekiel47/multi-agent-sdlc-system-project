@@ -305,10 +305,69 @@ async def get_task(
     task_id: UUID,
     store: EpisodicStore = Depends(get_store),  # noqa: B008
 ) -> TaskDetailResponse:
-    """Return task detail with all fields."""
+    """Return task detail with all fields, including HITL enrichment."""
     row = await store.get_task(task_id)
     if row is None:
         raise HTTPException(status_code=404, detail="task_not_found")
+
+    # Enrich with HITL-related data from decisions and outcomes
+    pending_diff: str | None = None
+    hitl_cause: str | None = None
+    hitl_cause_detail: dict[str, object] | None = None
+    review_summary: str | None = None
+    test_summary: str | None = None
+    reject_reason: str | None = None
+
+    # For tasks that are or were in HITL state, fetch decisions and outcomes
+    if row.status in ("awaiting_hitl", "approved", "rejected", "completed", "failed"):
+        decisions = await store.get_decisions_for_task(task_id)
+        outcomes = await store.get_outcomes_for_task(task_id)
+
+        # Extract latest code_edit diff
+        for d in reversed(decisions):
+            if d.decision_type == "code_edit" and "diff" in d.decision_data:
+                pending_diff = d.decision_data["diff"]
+                break
+
+        # Extract latest review verdict summary
+        for d in reversed(decisions):
+            if d.decision_type == "review_verdict":
+                verdict = d.decision_data.get("verdict", "")
+                issues = d.decision_data.get("issues", [])
+                parts = [f"Verdict: {verdict}"]
+                if issues:
+                    parts.append(f"Issues ({len(issues)}): " + "; ".join(str(i) for i in issues[:5]))
+                review_summary = "\n".join(parts)
+                break
+
+        # Extract latest test report summary
+        for d in reversed(decisions):
+            if d.decision_type == "test_report":
+                passed = d.decision_data.get("passed", 0)
+                failed = d.decision_data.get("failed", 0)
+                failed_names = d.decision_data.get("failed_test_names", [])
+                parts = [f"Tests: {passed} passed, {failed} failed"]
+                if failed_names:
+                    parts.append("Failed: " + ", ".join(str(n) for n in failed_names[:5]))
+                test_summary = "\n".join(parts)
+                break
+
+        # Extract HITL cause from outcomes (loop_detected, uncertainty_escalation, etc.)
+        for o in reversed(outcomes):
+            if o.outcome in ("loop_detected", "uncertainty_escalation",
+                             "retry_budget_exhausted", "guardrail_block",
+                             "cost_budget_exhausted"):
+                hitl_cause = o.outcome
+                hitl_cause_detail = o.detail
+                break
+
+        # Extract reject reason if task was rejected via HITL
+        if row.hitl_decision == "reject":
+            for o in reversed(outcomes):
+                if o.outcome == "hitl_rejected" and o.detail and "reason" in o.detail:
+                    reject_reason = o.detail["reason"]
+                    break
+
     return TaskDetailResponse(
         id=row.id,
         repo_url=row.repo_url,
@@ -324,6 +383,12 @@ async def get_task(
         pr_url=row.pr_url,
         started_at=row.started_at,
         ended_at=row.ended_at,
+        pending_diff=pending_diff,
+        hitl_cause=hitl_cause,
+        hitl_cause_detail=hitl_cause_detail,
+        review_summary=review_summary,
+        test_summary=test_summary,
+        reject_reason=reject_reason,
     )
 
 

@@ -9,7 +9,33 @@ import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
+import { Separator } from "@/components/ui/separator";
 import { ApiError } from "@/lib/api-client";
+
+/** Map of HITL cause values to human-readable labels */
+const HITL_CAUSE_LABELS: Record<string, string> = {
+  loop_detected: "Loop Detected",
+  uncertainty_escalation: "Uncertainty Escalation",
+  retry_budget_exhausted: "Retry Budget Exhausted",
+  guardrail_block: "Guardrail Block",
+  cost_budget_exhausted: "Cost Budget Exhausted",
+};
+
+/** Map of HITL cause values to badge color classes */
+const HITL_CAUSE_COLORS: Record<string, string> = {
+  loop_detected: "bg-orange-500/15 text-orange-400",
+  uncertainty_escalation: "bg-purple-500/15 text-purple-400",
+  retry_budget_exhausted: "bg-red-500/15 text-red-400",
+  guardrail_block: "bg-red-500/15 text-red-400",
+  cost_budget_exhausted: "bg-red-500/15 text-red-400",
+};
+
+/** Safely escape HTML to prevent XSS when rendering user-provided text */
+function escapeHtml(text: string): string {
+  const div = document.createElement("div");
+  div.appendChild(document.createTextNode(text));
+  return div.innerHTML;
+}
 
 interface HitlApprovalProps {
   taskId: string;
@@ -67,9 +93,7 @@ export function HitlApproval({ taskId }: HitlApprovalProps) {
       });
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
-        setDecisionError(
-          "A decision has already been made for this task."
-        );
+        setDecisionError("A decision has already been made for this task.");
       } else if (err instanceof ApiError) {
         setDecisionError(err.message);
       } else {
@@ -90,9 +114,7 @@ export function HitlApproval({ taskId }: HitlApprovalProps) {
       });
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
-        setDecisionError(
-          "A decision has already been made for this task."
-        );
+        setDecisionError("A decision has already been made for this task.");
       } else if (err instanceof ApiError) {
         setDecisionError(err.message);
       } else {
@@ -101,7 +123,7 @@ export function HitlApproval({ taskId }: HitlApprovalProps) {
     }
   }
 
-  // Not awaiting HITL — show appropriate message
+  // Not awaiting HITL and no decision made — show appropriate message
   if (!isAwaitingHitl && !decisionAlreadyMade) {
     return (
       <Card>
@@ -118,7 +140,7 @@ export function HitlApproval({ taskId }: HitlApprovalProps) {
     );
   }
 
-  // Decision already made
+  // Decision already made — show final state
   if (decisionAlreadyMade) {
     return (
       <div className="space-y-4">
@@ -151,6 +173,18 @@ export function HitlApproval({ taskId }: HitlApprovalProps) {
                 View Pull Request →
               </a>
             )}
+            {task.reject_reason && (
+              <div className="space-y-1">
+                <span className="text-sm text-muted-foreground">Reject reason:</span>
+                {/* Render escaped text to prevent XSS */}
+                <p
+                  className="text-sm italic"
+                  dangerouslySetInnerHTML={{
+                    __html: escapeHtml(task.reject_reason),
+                  }}
+                />
+              </div>
+            )}
           </CardContent>
         </Card>
         <CostPanel task={task} />
@@ -178,8 +212,56 @@ export function HitlApproval({ taskId }: HitlApprovalProps) {
             <span className="text-muted-foreground"> #{task.issue_number}</span>
           </div>
 
+          {/* HITL cause (for non-PR escalations: loop_detected, uncertainty, etc.) */}
+          {task.hitl_cause && (
+            <div className="space-y-2">
+              <Separator />
+              <div className="flex items-center gap-2">
+                <Badge
+                  variant="outline"
+                  className={HITL_CAUSE_COLORS[task.hitl_cause] ?? "bg-yellow-500/15 text-yellow-400"}
+                >
+                  {HITL_CAUSE_LABELS[task.hitl_cause] ?? task.hitl_cause}
+                </Badge>
+                <span className="text-sm text-muted-foreground">
+                  This review was triggered by an escalation event.
+                </span>
+              </div>
+              {task.hitl_cause_detail && (
+                <div className="rounded-md bg-muted/50 p-3 text-xs font-mono space-y-1">
+                  {Object.entries(task.hitl_cause_detail).map(([key, value]) => (
+                    <div key={key}>
+                      <span className="text-muted-foreground">{key}: </span>
+                      <span className="text-foreground">{String(value)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Review summary */}
+          {task.review_summary && (
+            <div className="space-y-1">
+              <h3 className="text-sm font-semibold">Review Summary</h3>
+              <pre className="whitespace-pre-wrap text-sm text-muted-foreground rounded-md bg-muted/30 p-3">
+                {task.review_summary}
+              </pre>
+            </div>
+          )}
+
+          {/* Test summary */}
+          {task.test_summary && (
+            <div className="space-y-1">
+              <h3 className="text-sm font-semibold">Test Summary</h3>
+              <pre className="whitespace-pre-wrap text-sm text-muted-foreground rounded-md bg-muted/30 p-3">
+                {task.test_summary}
+              </pre>
+            </div>
+          )}
+
           {/* Diff viewer */}
-          <DiffViewer />
+          <DiffViewer diff={task.pending_diff} />
 
           {/* Decision buttons */}
           <div className="space-y-3 pt-2">
