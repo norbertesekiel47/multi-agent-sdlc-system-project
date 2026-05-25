@@ -183,7 +183,7 @@ class SweBenchRunner:
         """
         start_time = time.monotonic()
         instance_id = instance.instance_id
-        task_id = uuid4().hex[:12]
+        task_id = uuid4().hex
 
         logger.info(
             "Running SWE-bench instance %s (run %d, topology=%s)",

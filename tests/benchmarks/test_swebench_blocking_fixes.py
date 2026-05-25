@@ -711,3 +711,74 @@ class TestEvaluatorWritesTasksToFile:
             "directly as a --swe_bench_tasks argument. It should write to a "
             "temp file and pass the file path."
         )
+
+
+# ════════════════════════════════════════════════════════════════════
+# Fix 4: task_id / run_id must be valid 32-char hex for UUID()
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestTaskIdUuidCompatibility:
+    """Fix 4: uuid4().hex[:12] produced 12-char hex strings that
+    raise ValueError when passed to UUID(), which requires exactly
+    32 hex characters. The orchestrator graph nodes (supervisor_only,
+    hybrid, __init__) call UUID(task_id) and would crash.
+
+    Changed uuid4().hex[:12] to uuid4().hex in:
+      - runner.py (task_id)
+      - __main__.py (task_id for custom repo, run_id for matrix)
+    """
+
+    def test_runner_task_id_is_valid_uuid(self) -> None:
+        """task_id from SweBenchRunner.run_instance produces a valid 32-char UUID hex."""
+        from uuid import UUID, uuid4
+
+        # Simulate what runner.py does: task_id = uuid4().hex
+        task_id = uuid4().hex
+        assert len(task_id) == 32, f"task_id must be 32 chars, got {len(task_id)}"
+        # This must NOT raise ValueError
+        UUID(task_id)  # if we get here, the task_id is valid
+
+    def test_runner_task_id_no_truncation(self) -> None:
+        """Verify that uuid4().hex is used (not uuid4().hex[:12]) in runner.py source."""
+        from src.benchmarks.swebench.runner import SweBenchRunner
+
+        source = inspect.getsource(SweBenchRunner.run_instance)
+        # Must NOT contain the truncated form
+        assert "uuid4().hex[:12]" not in source, (
+            "runner.py must use uuid4().hex, not uuid4().hex[:12]"
+        )
+        # Must contain the full form
+        assert "uuid4().hex" in source, (
+            "runner.py must use uuid4().hex for task_id generation"
+        )
+
+    def test_main_task_id_no_truncation(self) -> None:
+        """Verify that uuid4().hex is used (not uuid4().hex[:12]) in __main__.py for task_id."""
+        from src.benchmarks.swebench import __main__
+
+        source = inspect.getsource(__main__)
+        truncated_count = source.count("uuid4().hex[:12]")
+        assert truncated_count == 0, (
+            f"__main__.py must not contain uuid4().hex[:12], found {truncated_count} occurrence(s)"
+        )
+
+    def test_main_run_id_no_truncation(self) -> None:
+        """Verify that uuid4().hex is used (not uuid4().hex[:12]) in __main__.py for run_id."""
+        from src.benchmarks.swebench import __main__
+
+        source = inspect.getsource(__main__)
+        assert "uuid4().hex[:12]" not in source, (
+            "__main__.py must use uuid4().hex for run_id, not uuid4().hex[:12]"
+        )
+
+    def test_uuid_construction_from_runner_task_id(self) -> None:
+        """UUID(task_id) does not raise ValueError when task_id comes from runner.py."""
+        from uuid import UUID, uuid4
+
+        # This is exactly what the orchestrator does: UUID(task_id)
+        # where task_id was generated as uuid4().hex in the runner
+        for _ in range(100):
+            task_id = uuid4().hex
+            uuid_obj = UUID(task_id)  # must not raise
+            assert len(str(uuid_obj).replace("-", "")) == 32

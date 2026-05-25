@@ -192,7 +192,7 @@ async def _run_custom_repo_instance(
     from src.benchmarks.swebench.runner import SweBenchRunner
 
     start_time = time.monotonic()
-    task_id = uuid4().hex[:12]
+    task_id = uuid4().hex
     repo_url = f"https://github.com/{issue['repo']}"
 
     logger.info(
@@ -426,7 +426,7 @@ async def _run_harness(args: argparse.Namespace) -> int:
     from src.benchmarks.swebench.evaluator import SweBenchEvaluator
     from src.benchmarks.swebench.loader import InstanceLoader
 
-    run_id = uuid4().hex[:12]
+    run_id = uuid4().hex
 
     # Determine topologies to run
     topologies = (
