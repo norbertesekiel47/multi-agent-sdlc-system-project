@@ -825,7 +825,9 @@ class TestLLMSpanMetadata:
         assert data["tokens_in"] == 100
         assert data["tokens_out"] == 50
         assert data["cached_tokens"] == 20
-        assert data["cost_usd"] == "0.0123"
+        # cost_usd is serialized as float (not Decimal string) per M5 contract fix
+        assert data["cost_usd"] == pytest.approx(0.0123)
+        assert isinstance(data["cost_usd"], float)
 
     def test_span_io_truncated_at_2kb(self) -> None:
         """VAL-TRACING-005: Span I/O truncated at 2 KB with marker."""
@@ -856,7 +858,7 @@ class TestAgentSpanTagging:
     """Each agent turn emits a span tagged with the agent name."""
 
     def test_trace_event_carries_agent_metadata(self) -> None:
-        """TraceEvent metadata includes agent name."""
+        """TraceEvent metadata includes agent name AND top-level agent field."""
         from src.tracing.ws_broadcaster import TraceEvent
 
         for agent in ("planner", "coder", "reviewer", "qa", "supervisor"):
@@ -870,6 +872,8 @@ class TestAgentSpanTagging:
             )
             data = json.loads(event.to_json())
             assert data["metadata"]["agent"] == agent
+            # M5 contract fix: agent must be top-level, not just in metadata
+            assert data["agent"] == agent
             assert data["name"] == f"{agent}.turn"
 
 

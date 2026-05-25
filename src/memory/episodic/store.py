@@ -240,10 +240,16 @@ class EpisodicStore:
         status: str | None = None,
         outcome: str | None = None,
         topology: str | None = None,
+        repo: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[TaskRow]:
-        """List tasks with optional filters."""
+        """List tasks with optional filters.
+
+        The ``repo`` parameter performs case-insensitive substring
+        matching on ``repo_url`` via SQL ``ILIKE``, applied **before**
+        LIMIT/OFFSET so pagination is reliable.
+        """
         conditions: list[str] = []
         args: list[Any] = []
         idx = 1
@@ -252,6 +258,12 @@ class EpisodicStore:
             canon_url = canonicalize_repo_url(repo_url)
             conditions.append(f"repo_url = ${idx}")
             args.append(canon_url)
+            idx += 1
+
+        if repo is not None and repo.strip():
+            # Case-insensitive substring filter in SQL (not client-side)
+            conditions.append(f"repo_url ILIKE ${idx}")
+            args.append(f"%{repo.strip()}%")
             idx += 1
 
         if status is not None:
@@ -516,6 +528,102 @@ class EpisodicStore:
                 )
 
         return [self._repo_fact_row_from_record(r) for r in rows]
+
+    # ── Trace history reconstruction ──────────────────────────────
+
+    async def get_trace_history(self, task_id: UUID) -> list[dict[str, Any]]:
+        """Reconstruct trace history from stored decisions and outcomes.
+
+        Returns a list of dicts matching the TraceEvent schema so the
+        frontend can backfill from ``GET /tasks/{id}.trace_history``.
+        Each decision becomes a ``node_end`` event; each outcome becomes
+        a ``task_complete`` or ``hitl_interrupt`` event.
+        """
+        decisions = await self.get_decisions_for_task(task_id)
+        outcomes = await self.get_outcomes_for_task(task_id)
+
+        events: list[dict[str, Any]] = []
+
+        for d in decisions:
+            dd = d.decision_data
+            event: dict[str, Any] = {
+                "type": "node_end",
+                "task_id": str(d.task_id),
+                "trace_id": str(d.task_id),
+                "span_id": str(d.id),
+                "parent_span_id": None,
+                "name": d.agent,
+                "span_type": "span",
+                "started_at": d.created_at.isoformat() if d.created_at else None,
+                "ended_at": d.created_at.isoformat() if d.created_at else None,
+                "tokens_in": dd.get("tokens_in", 0),
+                "tokens_out": dd.get("tokens_out", 0),
+                "cached_tokens": dd.get("cached_tokens", 0),
+                "cost_usd": float(dd.get("cost_usd", 0))
+                if dd.get("cost_usd") is not None
+                else 0.0,
+                "status": "ok",
+                "agent": d.agent,
+                "metadata": {
+                    "decision_type": d.decision_type,
+                    "step_index": d.step_index,
+                },
+            }
+            events.append(event)
+
+        # Add outcome events (task_complete / hitl_interrupt)
+        for o in outcomes:
+            if o.outcome in ("success", "pr_opened"):
+                events.append({
+                    "type": "task_complete",
+                    "task_id": str(o.task_id),
+                    "trace_id": str(o.task_id),
+                    "span_id": str(o.id),
+                    "parent_span_id": None,
+                    "name": o.outcome,
+                    "span_type": "span",
+                    "started_at": o.recorded_at.isoformat() if o.recorded_at else None,
+                    "ended_at": o.recorded_at.isoformat() if o.recorded_at else None,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "cached_tokens": 0,
+                    "cost_usd": 0.0,
+                    "status": "ok",
+                    "agent": None,
+                    "metadata": o.detail or {},
+                })
+            elif o.outcome in (
+                "loop_detected",
+                "uncertainty_escalation",
+                "retry_budget_exhausted",
+                "guardrail_block",
+                "cost_budget_exhausted",
+                "hitl_rejected",
+                "sandbox_failure",
+            ):
+                events.append({
+                    "type": "hitl_interrupt",
+                    "task_id": str(o.task_id),
+                    "trace_id": str(o.task_id),
+                    "span_id": str(o.id),
+                    "parent_span_id": None,
+                    "name": o.outcome,
+                    "span_type": "span",
+                    "started_at": o.recorded_at.isoformat() if o.recorded_at else None,
+                    "ended_at": o.recorded_at.isoformat() if o.recorded_at else None,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "cached_tokens": 0,
+                    "cost_usd": 0.0,
+                    "status": "ok",
+                    "agent": None,
+                    "metadata": {"cause": o.outcome, **(o.detail or {})},
+                })
+
+        # Sort by started_at (timestamp) for chronological order
+        events.sort(key=lambda e: e.get("started_at") or "")
+
+        return events
 
     # ── Planner context helper ───────────────────────────────────
 

@@ -272,20 +272,18 @@ async def list_tasks(
 
     The ``repo`` parameter performs case-insensitive substring matching
     on repo_url, unlike ``repo_url`` which does exact match.
+    The filter is applied in the SQL query (not client-side) so
+    pagination with repo filter is reliable.
     """
     rows = await store.list_tasks(
         repo_url=repo_url,
         status=status,
         outcome=outcome,
         topology=topology,
+        repo=repo,
         limit=limit,
         offset=offset,
     )
-
-    # Client-side repo substring filter (case-insensitive)
-    if repo is not None and repo.strip():
-        repo_lower = repo.strip().lower()
-        rows = [r for r in rows if repo_lower in r.repo_url.lower()]
 
     # Fetch latest outcomes for all returned tasks
     task_ids = [r.id for r in rows]
@@ -386,6 +384,9 @@ async def get_task(
                     reject_reason = o.detail["reason"]
                     break
 
+    # Reconstruct trace history from stored decisions and outcomes
+    trace_history = await store.get_trace_history(task_id)
+
     return TaskDetailResponse(
         id=row.id,
         repo_url=row.repo_url,
@@ -402,6 +403,7 @@ async def get_task(
         pr_url=row.pr_url,
         started_at=row.started_at,
         ended_at=row.ended_at,
+        trace_history=trace_history,
         pending_diff=pending_diff,
         hitl_cause=hitl_cause,
         hitl_cause_detail=hitl_cause_detail,

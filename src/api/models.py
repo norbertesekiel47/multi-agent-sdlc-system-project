@@ -90,6 +90,8 @@ class TaskDetailResponse(BaseModel):
     pr_url: str | None = None
     started_at: datetime
     ended_at: datetime | None = None
+    # Historical trace events for backfill on page load / reconnect
+    trace_history: list[dict[str, object]] | None = None
     # HITL enrichment fields — populated when status is awaiting_hitl
     pending_diff: str | None = None
     hitl_cause: str | None = None

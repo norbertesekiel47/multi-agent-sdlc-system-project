@@ -77,7 +77,23 @@ class TraceEvent:
         self.metadata = metadata or {}
 
     def to_json(self) -> str:
-        """Serialize to a JSON string suitable for WebSocket transmission."""
+        """Serialize to a JSON string suitable for WebSocket transmission.
+
+        Contract guarantees for frontend consumption:
+          - ``cost_usd`` is a **float** (never a Decimal string like '0.0100').
+          - ``agent`` is a **top-level** field extracted from
+            ``metadata.agent_name`` (or ``metadata.agent``) when present.
+          - ``cached_tokens`` is always present as a top-level field.
+        """
+        # Extract agent name from metadata for top-level field
+        agent: str | None = None
+        if self.metadata:
+            agent = (
+                self.metadata.get("agent_name")
+                or self.metadata.get("agent")
+                or None
+            )
+
         data = {
             "type": self.type,
             "task_id": self.task_id,
@@ -91,8 +107,9 @@ class TraceEvent:
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
             "cached_tokens": self.cached_tokens,
-            "cost_usd": str(self.cost_usd),
+            "cost_usd": float(self.cost_usd),
             "status": self.status,
+            "agent": agent,
             "metadata": self.metadata,
         }
         return json.dumps(data, default=str)
