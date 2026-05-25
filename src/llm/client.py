@@ -35,6 +35,35 @@ logger = logging.getLogger(__name__)
 # Default OpenRouter base URL
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+# Default temperature for non-benchmark runs (VAL-REPRO-004).
+# Benchmark runs set LLM_TEMPERATURE=0 via the SWE-bench harness.
+_DEFAULT_TEMPERATURE: float = 0.2
+
+
+def get_temperature() -> float:
+    """Return the LLM temperature for the current run context.
+
+    Reads ``LLM_TEMPERATURE`` from the environment.  If not set,
+    returns the default of 0.2 (for normal task runs).
+
+    The SWE-bench benchmark harness sets ``LLM_TEMPERATURE=0`` before
+    invoking the orchestrator, so benchmark runs get temperature 0.0.
+
+    VAL-REPRO-004: default temperature is 0.2 for non-benchmark,
+    0.0 for benchmark.
+    """
+    env_val = os.getenv("LLM_TEMPERATURE")
+    if env_val is not None:
+        try:
+            return float(env_val)
+        except ValueError:
+            logger.warning(
+                "Invalid LLM_TEMPERATURE=%r, falling back to default %.1f",
+                env_val,
+                _DEFAULT_TEMPERATURE,
+            )
+    return _DEFAULT_TEMPERATURE
+
 
 class LLMCallResult:
     """Result of a single LLM call, including cost and token metadata."""

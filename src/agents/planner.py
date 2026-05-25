@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 
 from src.agents.models import ChangePlan, IssueContext
+from src.llm.client import get_temperature
 from src.memory.episodic.models import CreateDecisionParams
 
 if TYPE_CHECKING:
@@ -325,7 +326,11 @@ async def run_planner(
     # Build the user prompt from IssueContext
     user_prompt = _build_planner_prompt(issue_context)
 
-    result = await planner.run(user_prompt, deps=deps)
+    result = await planner.run(
+        user_prompt,
+        deps=deps,
+        model_settings={"temperature": get_temperature()},
+    )
     plan: ChangePlan = result.output
 
     # Persist the ChangePlan if a store is available

@@ -114,18 +114,51 @@ Cause-tagged HITL escalation counts per topology. Escalations are triggered dete
 
 ### Prerequisites
 
-- Python 3.14+
-- Node 24 (pnpm)
-- Docker 29+
-- `.env` with `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `GITHUB_PAT`, `GITHUB_USERNAME`, `HUGGINGFACE_TOKEN`
+- **Python 3.14+** (system default on this host)
+- **Node 24** (pnpm as package manager; Node 22 LTS via `fnm` for promptfoo only)
+- **Docker 29+** (daemon running; images pre-pulled: `pgvector/pgvector:pg17`, `langfuse/langfuse:3`)
+- **pnpm** — `corepack enable && corepack prepare pnpm@latest --activate`
+- **Credentials** in `.env` (copy from `.env.example`):
+  - `OPENROUTER_API_KEY` — LLM gateway
+  - `OPENAI_API_KEY` — embeddings
+  - `GITHUB_PAT` — repo clone/push/PR (needs `Contents:write`, `PullRequests:write`, `Issues:read`)
+  - `GITHUB_USERNAME` — GitHub account
+  - `HUGGINGFACE_TOKEN` — SWE-bench dataset access
 
-### Install
+### Environment
+
+| Property | Value |
+|---|---|
+| OS | macOS Darwin 25.4.0, arm64 (Apple Silicon) |
+| RAM | 24 GB |
+| CPUs | 12 (6 workers for pytest-xdist) |
+| Python | 3.14.4 |
+| Node | 24.15.0 (22 LTS via fnm for promptfoo) |
+| Docker | 29.4.3 |
+| pnpm | 11.0.9 |
+| Port range | 3100–3199 (mission services) + 5433 (Postgres) |
+
+### Clean Clone Setup
 
 ```bash
-# Idempotent setup
-bash init.sh
+git clone <repo-url> && cd MultiAgenticSystem
+cp .env.example .env   # Fill in real credentials
+bash init.sh            # Idempotent: venv, pip, pnpm, Docker images, compose up, DB schema
+```
 
-# Install Python + Node dependencies
+`init.sh` does all of the following (safe to re-run):
+1. Creates Python 3.14 venv + installs pinned dependencies
+2. Installs Node dependencies via `pnpm install --frozen-lockfile`
+3. Builds custom sandbox images (`sdlc-swarm/sandbox-base:latest`, `sdlc-swarm/sandbox-proxy:latest`)
+4. Pulls `pgvector/pgvector:pg17` and `langfuse/langfuse:3`
+5. Starts Docker Compose stack (Postgres on 5433, Langfuse on 3110)
+6. Waits for Postgres and Langfuse to be ready
+7. Runs database schema initialization
+
+### Install (Manual)
+
+```bash
+# If not using init.sh, install manually:
 pip install -e ".[dev]"
 pnpm install
 ```
@@ -136,24 +169,33 @@ pnpm install
 # Start Postgres + pgvector + Langfuse
 docker compose --env-file .env -f infra/docker-compose.yml up -d
 
+# Initialize database schema (first run only)
+python -m src.db.init_schema
+
 # Start backend
 uvicorn src.api.main:app --host 0.0.0.0 --port 3100
 
-# Start dashboard
+# Start dashboard (in another terminal)
 NEXT_PUBLIC_API_URL=http://localhost:3100 pnpm --filter web dev --port 3101
 ```
 
 ### Test
 
 ```bash
-# Python test suite (pytest-xdist)
+# Python test suite (pytest-xdist, 6 workers)
 pytest -q --maxfail=5 -n 6 tests/
+
+# Sandbox isolation tests (must run serially — Docker networking constraints)
+pytest -v tests/sandbox/test_isolation.py
 
 # Type check
 mypy --strict src/
 
 # Lint
 ruff check src/ tests/
+
+# Frontend tests
+pnpm --filter web test
 ```
 
 ---
@@ -167,6 +209,19 @@ ruff check src/ tests/
 | Reviewer | `deepseek/deepseek-chat-v3-0324` | 0 (benchmark) / 0.2 (normal) |
 | QA | `deepseek/deepseek-chat-v3-0324` | 0 (benchmark) / 0.2 (normal) |
 | Embeddings | OpenAI `text-embedding-3-small` | — |
+
+> Model IDs are pinned in `pinned-models.yaml` and verified against runtime configuration by `test_pinned_models_all_roles_match` (VAL-REPRO-003).
+
+## Reproducibility
+
+| Mechanism | Detail |
+|---|---|
+| **Python deps** | All pinned with upper bounds (`>=X,<Y` or `==X`) in `pyproject.toml` (VAL-REPRO-001) |
+| **Node deps** | Locked via `pnpm-lock.yaml`; `pnpm install --frozen-lockfile` exits 0 on clean clone (VAL-REPRO-002) |
+| **Model IDs** | `pinned-models.yaml` maps each agent role to exact OpenRouter model ID; test asserts parity with runtime constants (VAL-REPRO-003) |
+| **Temperature** | Default 0.2 for normal task runs; SWE-bench harness sets `LLM_TEMPERATURE=0` for deterministic benchmark runs (VAL-REPRO-004) |
+| **KitOps** | `python -m src.packaging.kitops build` packages prompts + configs + `pinned-models.yaml` as a versioned OCI/ModelKit artifact (byte-for-byte reproducible) |
+| **Benchmark** | At temperature=0, the aggregator produces identical results JSON across consecutive runs (verified by `test_reproducibility_full_run_identical`) |
 
 ---
 

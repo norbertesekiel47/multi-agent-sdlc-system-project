@@ -37,7 +37,7 @@ from pydantic_ai import Agent, RunContext
 
 from src.agents.models import CodeEdit, ReviewResult
 from src.llm.caching import StructuredPrompt, build_structured_prompt
-from src.llm.client import get_llm_client
+from src.llm.client import get_llm_client, get_temperature
 from src.llm.cost import estimate_cost_tiktoken
 from src.memory.episodic.models import CreateDecisionParams
 
@@ -519,7 +519,7 @@ async def run_reviewer(
         task_id=str(task_id),
         trace_id=trace_id,
         agent_name="reviewer",
-        temperature=0.2,
+        temperature=get_temperature(),
     )
 
     # ── Parse JSON response as ReviewResult ─────────────────────

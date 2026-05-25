@@ -29,6 +29,7 @@ from src.agents.models import (
 )
 from src.agents.single_agent import SandboxTools, single_agent
 from src.github_client.client import GitHubClient, canonicalize_repo_url
+from src.llm.client import get_temperature
 from src.llm.cost import estimate_cost_tiktoken, get_max_cost_per_task
 from src.logging.secret_filter import install_secret_filter
 from src.memory.episodic.models import (
@@ -260,6 +261,7 @@ async def run_single_agent_e2e(
         result = await single_agent.run(
             issue_context.model_dump_json(),
             deps=tools,
+            model_settings={"temperature": get_temperature()},
         )
         agent_output = result.output
 
