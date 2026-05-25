@@ -16,20 +16,18 @@ import json
 import math
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
-
 from src.benchmarks.swebench.aggregator import (
-    VALID_HITL_CAUSES,
     _Z_95,
+    VALID_HITL_CAUSES,
     Aggregator,
     _ci_95,
     _mean,
     _variance,
 )
-from src.benchmarks.swebench.models import RunConfig, SweBenchInstance, SweBenchResult
-
+from src.benchmarks.swebench.models import RunConfig, SweBenchInstance
 
 # ── Fixtures ────────────────────────────────────────────────────
 
@@ -99,7 +97,11 @@ def sample_instance_result() -> dict[str, Any]:
             },
         ],
         "hitl_escalations": [
-            {"cause": "uncertainty_escalation", "trigger": "persistent_test_failure", "agent": "qa"},
+            {
+                "cause": "uncertainty_escalation",
+                "trigger": "persistent_test_failure",
+                "agent": "qa",
+            },
         ],
     }
 
@@ -378,7 +380,11 @@ class TestHITLEscalations:
             "hitl_escalations": [
                 {"cause": "loop_detected", "trigger": "loop_detected", "agent": "coder"},
                 {"cause": "loop_detected", "trigger": "loop_detected", "agent": "coder"},
-                {"cause": "uncertainty_escalation", "trigger": "pydantic_validation_3x", "agent": "reviewer"},
+                {
+                    "cause": "uncertainty_escalation",
+                    "trigger": "pydantic_validation_3x",
+                    "agent": "reviewer",
+                },
             ],
         }
 
@@ -393,7 +399,11 @@ class TestHITLEscalations:
     def test_per_instance_escalations_preserved(self) -> None:
         """Per-instance hitl_escalations list is preserved in output."""
         escalations = [
-            {"cause": "retry_budget_exhausted", "trigger": "retry_budget_exhausted", "agent": "coder"},
+            {
+                "cause": "retry_budget_exhausted",
+                "trigger": "retry_budget_exhausted",
+                "agent": "coder",
+            },
         ]
         instance_result = {
             "instance_id": "test-1",
@@ -508,7 +518,7 @@ class TestMarkdownReport:
     ) -> None:
         """Markdown report includes tokens, duration, retries columns."""
         agg = Aggregator(output_dir=str(tmp_path))
-        results_doc = agg.aggregate_and_persist(
+        agg.aggregate_and_persist(
             instance_results=[sample_instance_result],
             run_id="test-run-001",
             slice_size=30,
@@ -719,7 +729,7 @@ class TestRunnerReturnValue:
         from src.benchmarks.swebench.runner import SweBenchRunner
 
         config = RunConfig(topology="supervisor_only")
-        runner = SweBenchRunner(config=config)
+        _ = SweBenchRunner(config=config)
 
         # We can't run the full harness in a unit test, but we can
         # verify the return structure expected by the aggregator.
@@ -743,11 +753,10 @@ class TestRunnerReturnValue:
 
         # Verify the run_instance method signature returns all expected fields
         # by checking the error path (which returns a dict with all fields)
-        import time
         from src.benchmarks.swebench.models import SweBenchInstance
 
         # The error path in run_instance returns all fields
-        instance = SweBenchInstance(
+        _ = SweBenchInstance(
             instance_id="test-error",
             repo="test/repo",
             base_commit="abc123",

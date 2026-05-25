@@ -471,7 +471,7 @@ class TestRunnerBranchesOnTopology:
             mock_graph.compile.return_value.ainvoke = AsyncMock(return_value={})
             mock_build_hybrid.return_value = mock_graph
 
-            result = await runner._invoke_orchestrator(
+            _ = await runner._invoke_orchestrator(
                 instance=instance,
                 repo_url=f"https://github.com/{instance.repo}",
                 task_id="test-task-001",
