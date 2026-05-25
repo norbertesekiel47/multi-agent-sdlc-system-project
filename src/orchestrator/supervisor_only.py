@@ -47,8 +47,10 @@ from uuid import UUID, uuid4
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
+from pydantic import ValidationError
 
 from src.agents.models import ChangePlan, CodeEdit, IssueContext, ReviewResult, TestReport
+from src.failure_modes.uncertainty import UncertaintyEscalation
 from src.github_client.client import GitHubClient, canonicalize_repo_url
 from src.llm.cost import estimate_cost_tiktoken, get_max_cost_per_task
 from src.orchestrator import OrchestratorState
@@ -189,6 +191,305 @@ def unregister_guardrail(task_id: str) -> None:
     """Remove guardrail and proxy from the registry."""
     _active_guardrails.pop(task_id, None)
     _active_sandbox_proxies.pop(task_id, None)
+
+
+# ── Recording Sandbox Proxy ───────────────────────────────────────
+# Wraps the GuardrailSandboxProxy to record tool calls for
+# loop detection and uncertainty escalation tracking.
+# After each agent turn, the orchestrator reads the recorded
+# tool calls and processes them through _check_loop_detection
+# and _record_tool_call_and_check.
+
+
+class _ToolCallRecord:
+    """A single recorded tool call with outcome."""
+
+    __slots__ = ("tool_name", "args", "success", "error_msg")
+
+    def __init__(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        success: bool,
+        error_msg: str = "",
+    ) -> None:
+        self.tool_name = tool_name
+        self.args = args
+        self.success = success
+        self.error_msg = error_msg
+
+
+# Per-task list of tool call recordings (cleared after each agent turn)
+_tool_call_recordings: dict[str, list[_ToolCallRecord]] = {}
+
+
+def _get_recordings(task_id: str) -> list[_ToolCallRecord]:
+    """Get the tool call recordings for a task."""
+    return _tool_call_recordings.get(task_id, [])
+
+
+def _clear_recordings(task_id: str) -> None:
+    """Clear the tool call recordings for a task."""
+    _tool_call_recordings.pop(task_id, None)
+
+
+class RecordingSandboxProxy:
+    """Wraps a GuardrailSandboxProxy to record tool call outcomes.
+
+    Agents receive this proxy as their ``sandbox_manager`` dep.
+    Every tool call is recorded for loop detection and uncertainty
+    escalation tracking.  The orchestrator reads the recordings
+    after each agent turn and processes them.
+    """
+
+    def __init__(self, inner: GuardrailSandboxProxy, task_id: str) -> None:
+        self._inner = inner
+        self._task_id = task_id
+        if task_id not in _tool_call_recordings:
+            _tool_call_recordings[task_id] = []
+
+    def _record(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        success: bool,
+        error_msg: str = "",
+    ) -> None:
+        _tool_call_recordings.setdefault(self._task_id, []).append(
+            _ToolCallRecord(tool_name, args, success, error_msg)
+        )
+
+    # ── Tool surface (record + delegate) ─────────────────────────
+
+    async def run_command(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: int | None = None,
+    ) -> str:
+        """Execute a command and record the outcome."""
+        try:
+            result = await self._inner.run_command(command, cwd=cwd, timeout=timeout)
+            self._record("run_command", {"command": command}, success=True)
+            return result
+        except Exception as exc:
+            self._record(
+                "run_command",
+                {"command": command},
+                success=False,
+                error_msg=str(exc)[:200],
+            )
+            raise
+
+    async def write_file(self, path: str, content: str) -> None:
+        """Write a file and record the outcome."""
+        try:
+            await self._inner.write_file(path, content)
+            self._record("write_file", {"path": path}, success=True)
+        except Exception as exc:
+            self._record("write_file", {"path": path}, success=False, error_msg=str(exc)[:200])
+            raise
+
+    async def read_file(self, path: str) -> str:
+        """Read a file and record the outcome."""
+        try:
+            result = await self._inner.read_file(path)
+            self._record("read_file", {"path": path}, success=True)
+            return result
+        except Exception as exc:
+            self._record("read_file", {"path": path}, success=False, error_msg=str(exc)[:200])
+            raise
+
+    async def apply_diff(self, diff: str) -> None:
+        """Apply a diff and record the outcome."""
+        try:
+            await self._inner.apply_diff(diff)
+            self._record("apply_diff", {"diff_length": len(diff)}, success=True)
+        except Exception as exc:
+            self._record(
+                "apply_diff",
+                {"diff_length": len(diff)},
+                success=False,
+                error_msg=str(exc)[:200],
+            )
+            raise
+
+    async def run_tests(self, test_command: str = "pytest") -> str:
+        """Run tests and record the outcome."""
+        try:
+            result = await self._inner.run_tests(test_command)
+            self._record("run_tests", {"test_command": test_command}, success=True)
+            return result
+        except Exception as exc:
+            self._record(
+                "run_tests",
+                {"test_command": test_command},
+                success=False,
+                error_msg=str(exc)[:200],
+            )
+            raise
+
+    # ── Direct delegation (no recording) ─────────────────────────
+
+    @property
+    def is_running(self) -> bool:
+        return self._inner.is_running
+
+    @property
+    def container_id(self) -> str | None:
+        return self._inner.container_id
+
+    @property
+    def task_id(self) -> str:
+        return self._task_id
+
+    @property
+    def workspace_dir(self) -> Any:
+        return self._inner.workspace_dir
+
+    async def setup(self) -> None:
+        await self._inner.setup()
+
+    async def teardown(self) -> None:
+        await self._inner.teardown()
+
+    @property
+    def unwrapped(self) -> GuardrailSandboxProxy:
+        """Return the underlying GuardrailSandboxProxy."""
+        return self._inner
+
+
+def get_recording_proxy(task_id: str) -> RecordingSandboxProxy | None:
+    """Create a RecordingSandboxProxy wrapping the guardrail proxy.
+
+    Returns None if no guardrail proxy exists for the task.
+    """
+    base_proxy = get_sandbox_proxy(task_id)
+    if base_proxy is None:
+        return None
+    return RecordingSandboxProxy(base_proxy, task_id)
+
+
+async def _process_tool_call_recordings(
+    *,
+    agent_name: str,
+    step_index: int,
+    state: OrchestratorState,
+    trace_id: str,
+    parent_span_id: str | None,
+) -> dict[str, Any] | None:
+    """Process tool call recordings from the last agent turn.
+
+    Reads the recordings from the per-task registry, processes them
+    through loop detection and uncertainty escalation, and returns
+    a state update dict if escalation is detected.
+
+    This is called after each agent node completes. It:
+    1. Processes each recorded tool call through _check_loop_detection
+    2. Records tool call outcomes for uncertainty escalation
+    3. Returns an escalation state update if triggered, or None
+    """
+    recordings = _get_recordings(state.task_id)
+    if not recordings:
+        return None
+
+    # Process each recording
+    accumulated_update: dict[str, Any] = {}
+    for rec in recordings:
+        # Record tool call for uncertainty escalation (tool error rate)
+        ue = _reconstruct_uncertainty(state)
+        # Merge any accumulated updates into the state we use
+        if accumulated_update.get("tool_error_windows"):
+            state_data = state.model_dump()
+            state_data.update(accumulated_update)
+            # Reconstruct state with updated fields
+            ue._tool_error_windows = {
+                k: deque(v, maxlen=10)
+                for k, v in state_data.get("tool_error_windows", {}).items()
+            }
+
+        trigger = ue.record_tool_call(agent_name, rec.success, step_index)
+        ue_update = _sync_uncertainty_to_state(ue)
+        accumulated_update.update(ue_update)
+
+        # Check loop detection for this tool call
+        loop_result = await _check_loop_detection(
+            agent_name=agent_name,
+            tool_name=rec.tool_name,
+            args=rec.args,
+            state=state,
+            trace_id=trace_id,
+            parent_span_id=parent_span_id,
+        )
+        if loop_result is not None:
+            # Loop detected — return immediately
+            loop_result.update(ue_update)
+            _clear_recordings(state.task_id)
+            return loop_result
+
+        # Update tool call history
+        history_update = _get_tool_call_history_update(
+            agent_name, rec.tool_name, rec.args, state,
+        )
+        accumulated_update["tool_call_history"] = history_update
+
+        if trigger is not None:
+            # Tool error rate exceeded → uncertainty escalation
+            logger.warning(
+                "Uncertainty escalation: %s after tool call %s by %s",
+                trigger.trigger, rec.tool_name, agent_name,
+            )
+            # Report to Langfuse
+            tracing = get_tracing_client()
+            tracing.create_span(
+                trace_id=trace_id,
+                parent_span_id=parent_span_id,
+                name="failure_mode.uncertainty_escalation",
+                span_type=SpanType.SPAN,
+                input_data={"tool_name": rec.tool_name, "agent_name": agent_name},
+                output_data=trigger.to_outcome_data(),
+                metadata={
+                    "failure_mode": "uncertainty_escalation",
+                    "trigger": trigger.trigger,
+                    "agent_name": agent_name,
+                },
+                start_time=datetime.now(UTC),
+                end_time=datetime.now(UTC),
+                level="ERROR",
+            )
+
+            # Write outcome
+            store = get_store(state.task_id)
+            if store is not None:
+                from src.memory.episodic.models import CreateOutcomeParams
+                await store.create_outcome(
+                    CreateOutcomeParams(
+                        task_id=UUID(state.task_id),
+                        outcome="uncertainty_escalation",
+                        detail=trigger.to_outcome_data()["detail"],
+                    ),
+                )
+
+            _clear_recordings(state.task_id)
+            return {
+                "errors": [
+                    f"Uncertainty escalation: {trigger.trigger} for agent {agent_name}"
+                ],
+                "outcome": "uncertainty_escalation",
+                "status": "awaiting_hitl",
+                **accumulated_update,
+            }
+
+    # Clear recordings for the next agent turn
+    _clear_recordings(state.task_id)
+
+    # Return accumulated updates if any changed
+    has_changes = any(
+        accumulated_update.get(k) != getattr(state, k, None)
+        for k in ("tool_call_history", "tool_error_windows", "uncertainty_fired")
+    )
+    return accumulated_update if has_changes else None
 
 
 async def _handle_guardrail_violation(
@@ -610,6 +911,248 @@ def _get_tool_call_history_update(
     return new_history
 
 
+# ── Uncertainty Escalation reconstruction from state ──────────────
+
+
+def _reconstruct_uncertainty(state: OrchestratorState) -> UncertaintyEscalation:
+    """Reconstruct an UncertaintyEscalation instance from state fields.
+
+    LangGraph serializes state between nodes, so we can't store
+    live objects.  Instead, we reconstruct from the state fields
+    each time we need to check/record.
+    """
+    from src.failure_modes.uncertainty import UncertaintyEscalation
+
+    ue = UncertaintyEscalation()
+    # Restore internal state from OrchestratorState fields
+    ue._pydantic_fail_counters = dict(state.pydantic_fail_counters)
+    ue._test_failure_count = state.test_failure_count
+    ue._rejected_diff_hashes = dict(state.rejected_diff_hashes)
+    ue._tool_error_windows = {
+        k: deque(v, maxlen=10)
+        for k, v in state.tool_error_windows.items()
+    }
+    ue._trigger_fired = state.uncertainty_fired
+    return ue
+
+
+def _sync_uncertainty_to_state(
+    ue: UncertaintyEscalation,
+) -> dict[str, Any]:
+    """Sync the UncertaintyEscalation state back to a state update dict.
+
+    Returns only the fields that need updating.
+    """
+    return {
+        "pydantic_fail_counters": dict(ue._pydantic_fail_counters),
+        "test_failure_count": ue._test_failure_count,
+        "rejected_diff_hashes": dict(ue._rejected_diff_hashes),
+        "tool_error_windows": {
+            k: list(v) for k, v in ue._tool_error_windows.items()
+        },
+        "uncertainty_fired": ue._trigger_fired,
+    }
+
+
+# ── Record a tool call outcome and check for escalation ──────────
+
+
+async def _record_tool_call_and_check(
+    *,
+    agent_name: str,
+    tool_name: str,
+    args: dict[str, Any],
+    success: bool,
+    step_index: int,
+    state: OrchestratorState,
+    trace_id: str,
+    parent_span_id: str | None,
+) -> dict[str, Any] | None:
+    """Record a tool call outcome and check for loop detection + uncertainty.
+
+    This is called after every tool call dispatched from an agent node.
+    It:
+    1. Records the tool call in the loop detection sliding window
+    2. Checks if loop detection triggers
+    3. Records the tool call success/failure for uncertainty escalation
+    4. Checks if uncertainty escalation triggers
+
+    Returns a state update dict if escalation is detected, or None.
+    """
+    # ── Loop detection ────────────────────────────────────────
+    loop_result = await _check_loop_detection(
+        agent_name=agent_name,
+        tool_name=tool_name,
+        args=args,
+        state=state,
+        trace_id=trace_id,
+        parent_span_id=parent_span_id,
+    )
+    if loop_result is not None:
+        # Loop detected — merge uncertainty state update into the loop result
+        ue = _reconstruct_uncertainty(state)
+        trigger = ue.record_tool_call(agent_name, success, step_index)
+        ue_update = _sync_uncertainty_to_state(ue)
+        loop_result.update(ue_update)
+        return loop_result
+
+    # ── Uncertainty escalation (tool error rate) ──────────────
+    ue = _reconstruct_uncertainty(state)
+    trigger = ue.record_tool_call(agent_name, success, step_index)
+    ue_update = _sync_uncertainty_to_state(ue)
+
+    if trigger is not None:
+        # Tool error rate exceeded → uncertainty escalation
+        logger.warning(
+            "Uncertainty escalation: %s for agent=%s after tool call %s",
+            trigger.trigger, agent_name, tool_name,
+        )
+        # Report to Langfuse
+        tracing = get_tracing_client()
+        tracing.create_span(
+            trace_id=trace_id,
+            parent_span_id=parent_span_id,
+            name="failure_mode.uncertainty_escalation",
+            span_type=SpanType.SPAN,
+            input_data={"tool_name": tool_name, "agent_name": agent_name},
+            output_data=trigger.to_outcome_data(),
+            metadata={
+                "failure_mode": "uncertainty_escalation",
+                "trigger": trigger.trigger,
+                "agent_name": agent_name,
+            },
+            start_time=datetime.now(UTC),
+            end_time=datetime.now(UTC),
+            level="ERROR",
+        )
+
+        # Write outcome
+        store = get_store(state.task_id)
+        if store is not None:
+            from src.memory.episodic.models import CreateOutcomeParams
+            await store.create_outcome(
+                CreateOutcomeParams(
+                    task_id=UUID(state.task_id),
+                    outcome="uncertainty_escalation",
+                    detail=trigger.to_outcome_data()["detail"],
+                )
+            )
+
+        return {
+            "errors": [
+                f"Uncertainty escalation: {trigger.trigger} for agent {agent_name}"
+            ],
+            "outcome": "uncertainty_escalation",
+            "status": "awaiting_hitl",
+            **ue_update,
+        }
+
+    # No escalation — return the updated tool call history and
+    # uncertainty state (the caller should merge these)
+    new_history = _get_tool_call_history_update(agent_name, tool_name, args, state)
+    return {
+        "tool_call_history": new_history,
+        **ue_update,
+    }
+
+
+# ── Record Pydantic validation failure and check escalation ──────
+
+
+def _record_pydantic_failure(
+    *,
+    agent_name: str,
+    step_index: int,
+    state: OrchestratorState,
+) -> dict[str, Any] | None:
+    """Record a Pydantic validation failure and check for escalation.
+
+    Returns a state update dict if escalation is detected, or None.
+    Called when an agent's output fails Pydantic validation.
+    """
+    ue = _reconstruct_uncertainty(state)
+    trigger = ue.record_pydantic_failure(agent_name, step_index)
+    ue_update = _sync_uncertainty_to_state(ue)
+
+    if trigger is not None:
+        logger.warning(
+            "Uncertainty escalation: pydantic_validation_3x for %s:%d",
+            agent_name, step_index,
+        )
+        return {
+            "errors": [
+                f"Uncertainty escalation: pydantic_validation_3x for "
+                f"{agent_name} at step {step_index}"
+            ],
+            "outcome": "uncertainty_escalation",
+            "status": "awaiting_hitl",
+            **ue_update,
+        }
+
+    # No escalation yet — just sync the counter back
+    if ue_update.get("pydantic_fail_counters") == state.pydantic_fail_counters:
+        return None
+    return ue_update
+
+
+def _record_pydantic_success(
+    *,
+    agent_name: str,
+    step_index: int,
+    state: OrchestratorState,
+) -> dict[str, Any]:
+    """Record a successful Pydantic validation (resets counter).
+
+    Returns the state update dict with reset counter.
+    """
+    ue = _reconstruct_uncertainty(state)
+    ue.record_pydantic_success(agent_name, step_index)
+    return _sync_uncertainty_to_state(ue)
+
+
+# ── Record diff rejection and check escalation ────────────────────
+
+
+def _record_diff_rejection_check(
+    *,
+    diff_hash: str,
+    agent_name: str,
+    step_index: int,
+    state: OrchestratorState,
+) -> dict[str, Any] | None:
+    """Record a diff rejection and check for same_fix_rejected_twice.
+
+    Called in route_after_review when verdict is reject_with_changes.
+    Returns a state update dict if escalation is detected, or None.
+    """
+    if not diff_hash:
+        return None
+
+    ue = _reconstruct_uncertainty(state)
+    trigger = ue.record_diff_rejection(diff_hash, agent_name, step_index)
+    ue_update = _sync_uncertainty_to_state(ue)
+
+    if trigger is not None:
+        logger.warning(
+            "Uncertainty escalation: same_fix_rejected_twice for hash=%s…",
+            diff_hash[:12],
+        )
+        return {
+            "errors": [
+                f"Uncertainty escalation: same_fix_rejected_twice "
+                f"for diff_hash {diff_hash[:12]}…"
+            ],
+            "outcome": "uncertainty_escalation",
+            "status": "awaiting_hitl",
+            **ue_update,
+        }
+
+    # No escalation — just sync the rejected hashes back
+    if ue_update.get("rejected_diff_hashes") == state.rejected_diff_hashes:
+        return None
+    return ue_update
+
+
 # ── Routing functions ───────────────────────────────────────────────
 
 
@@ -927,6 +1470,17 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
             event_type="node_end",
             metadata={"agent_name": "planner", "error": str(exc)[:200]},
         )
+        # Record Pydantic validation failure if applicable
+        if isinstance(exc, ValidationError):
+            escalation_update = _record_pydantic_failure(
+                agent_name="planner",
+                step_index=state.step_index,
+                state=state,
+            )
+            if escalation_update is not None and escalation_update.get(
+                "outcome"
+            ) == "uncertainty_escalation":
+                return {**escalation_update}
         return {
             "errors": [f"Planner failed: {exc}"],
             "outcome": "sandbox_failure",
@@ -976,6 +1530,13 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
             "status": "failed",
         }
 
+    # Record successful Pydantic validation (resets failure counter)
+    success_update = _record_pydantic_success(
+        agent_name="planner",
+        step_index=state.step_index,
+        state=state,
+    )
+
     return {
         "change_plan": plan,
         "issue_context": issue_context,
@@ -983,6 +1544,7 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
         "total_tokens_in": state.total_tokens_in + tokens_in,
         "total_tokens_out": state.total_tokens_out + tokens_out,
         "step_index": state.step_index,
+        **success_update,
     }
 
 
@@ -1056,9 +1618,10 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
-            # Use guardrail-wrapped sandbox proxy for agent deps
+            # Use recording sandbox proxy for agent deps
             # (VAL-GUARDRAIL-011: middleware intercepts tool calls before executor)
-            sandbox_proxy = get_sandbox_proxy(task_id)
+            # Also records tool calls for loop detection + uncertainty escalation
+            sandbox_proxy = get_recording_proxy(task_id) or get_sandbox_proxy(task_id)
             coder_result: CoderRunResult = await _run_coder_agent(
                 change_plan=state.change_plan,
                 review_result=state.review_result,
@@ -1087,6 +1650,31 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
                 span_id=coder_span_id,
                 parent_span_id=supervisor_span_id,
             )
+        except ValidationError as ve:
+            # Record Pydantic validation failure for uncertainty escalation
+            logger.warning(
+                "Coder output failed Pydantic validation for task %s: %s",
+                task_id, ve,
+            )
+            tracing.update_span(
+                trace_id=trace_id,
+                span_id=coder_span_id or "",
+                output_data={"error": f"ValidationError: {ve}"[:500]},
+                end_time=datetime.now(UTC),
+                level="ERROR",
+            )
+            escalation_update = _record_pydantic_failure(
+                agent_name="coder",
+                step_index=state.step_index,
+                state=state,
+            )
+            if escalation_update is not None:
+                return {**escalation_update}
+            return {
+                "errors": [f"Coder validation failed: {ve}"],
+                "outcome": "sandbox_failure",
+                "status": "failed",
+            }
         except Exception as exc:
             logger.error("Coder agent failed for task %s: %s", task_id, exc)
             tracing.update_span(
@@ -1155,6 +1743,27 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
             "status": "failed",
         }
 
+    # Record successful Pydantic validation (resets failure counter)
+    success_update = _record_pydantic_success(
+        agent_name="coder",
+        step_index=state.step_index,
+        state=state,
+    )
+
+    # Process recorded tool calls for loop detection + uncertainty
+    tool_recordings_update = await _process_tool_call_recordings(
+        agent_name="coder",
+        step_index=state.step_index,
+        state=state,
+        trace_id=trace_id,
+        parent_span_id=supervisor_span_id,
+    )
+    if tool_recordings_update is not None and tool_recordings_update.get("outcome") in (
+        "loop_detected",
+        "uncertainty_escalation",
+    ):
+        return {**tool_recordings_update, **success_update}
+
     return {
         "code_edit": edit,
         "retry_counters": new_retry_counters,
@@ -1162,6 +1771,8 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
         "total_tokens_in": state.total_tokens_in + tokens_in,
         "total_tokens_out": state.total_tokens_out + tokens_out,
         "total_tokens_cached": state.total_tokens_cached + cached_tokens,
+        **success_update,
+        **(tool_recordings_update or {}),
     }
 
 
@@ -1223,8 +1834,8 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
-            # Use guardrail-wrapped sandbox proxy (VAL-GUARDRAIL-011)
-            sandbox_proxy = get_sandbox_proxy(task_id)
+            # Use recording sandbox proxy (VAL-GUARDRAIL-011)
+            sandbox_proxy = get_recording_proxy(task_id) or get_sandbox_proxy(task_id)
             reviewer_result: ReviewerRunResult = await _run_reviewer_agent(
                 code_edit=state.code_edit,
                 sandbox_manager=sandbox_proxy or sandbox,
@@ -1252,6 +1863,31 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
                 span_id=reviewer_span_id,
                 parent_span_id=supervisor_span_id,
             )
+        except ValidationError as ve:
+            # Record Pydantic validation failure for uncertainty escalation
+            logger.warning(
+                "Reviewer output failed Pydantic validation for task %s: %s",
+                task_id, ve,
+            )
+            tracing.update_span(
+                trace_id=trace_id,
+                span_id=reviewer_span_id or "",
+                output_data={"error": f"ValidationError: {ve}"[:500]},
+                end_time=datetime.now(UTC),
+                level="ERROR",
+            )
+            escalation_update = _record_pydantic_failure(
+                agent_name="reviewer",
+                step_index=state.step_index,
+                state=state,
+            )
+            if escalation_update is not None:
+                return {**escalation_update}
+            return {
+                "errors": [f"Reviewer validation failed: {ve}"],
+                "outcome": "sandbox_failure",
+                "status": "failed",
+            }
         except Exception as exc:
             logger.error("Reviewer agent failed for task %s: %s", task_id, exc)
             tracing.update_span(
@@ -1321,12 +1957,63 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
             "status": "failed",
         }
 
+    # Record successful Pydantic validation (resets failure counter)
+    success_update = _record_pydantic_success(
+        agent_name="reviewer",
+        step_index=state.step_index,
+        state=state,
+    )
+
+    # Record diff rejection for uncertainty escalation tracking
+    # (VAL-UNCERTAINTY-003: same diff_hash rejected twice → escalation)
+    diff_rejection_update: dict[str, Any] = {}
+    if (
+        review is not None
+        and review.verdict == "reject_with_changes"
+        and state.code_edit is not None
+        and state.code_edit.diff_hash
+    ):
+        rejection_result = _record_diff_rejection_check(
+            diff_hash=state.code_edit.diff_hash,
+            agent_name="reviewer",
+            step_index=state.step_index,
+            state=state,
+        )
+        if (
+            rejection_result is not None
+            and rejection_result.get("outcome") == "uncertainty_escalation"
+        ):
+            # Same fix rejected twice → uncertainty escalation
+            return {**rejection_result}
+        # Merge non-escalation updates
+        diff_rejection_update = {
+            k: v for k, v in (rejection_result or {}).items()
+            if k != "outcome" and k != "status" and k != "errors"
+        }
+
+    # Process recorded tool calls for loop detection + uncertainty
+    tool_recordings_update = await _process_tool_call_recordings(
+        agent_name="reviewer",
+        step_index=state.step_index,
+        state=state,
+        trace_id=trace_id,
+        parent_span_id=supervisor_span_id,
+    )
+    if tool_recordings_update is not None and tool_recordings_update.get("outcome") in (
+        "loop_detected",
+        "uncertainty_escalation",
+    ):
+        return {**tool_recordings_update, **success_update, **diff_rejection_update}
+
     return {
         "review_result": review,
         "total_cost_usd": new_total_cost,
         "total_tokens_in": state.total_tokens_in + tokens_in,
         "total_tokens_out": state.total_tokens_out + tokens_out,
         "total_tokens_cached": state.total_tokens_cached + cached_tokens,
+        **success_update,
+        **diff_rejection_update,
+        **(tool_recordings_update or {}),
     }
 
 
@@ -1450,8 +2137,8 @@ async def run_qa(state: OrchestratorState) -> dict[str, Any]:
 
             sandbox = get_sandbox(task_id)
             store = get_store(task_id)
-            # Use guardrail-wrapped sandbox proxy (VAL-GUARDRAIL-011)
-            sandbox_proxy = get_sandbox_proxy(task_id)
+            # Use recording sandbox proxy (VAL-GUARDRAIL-011)
+            sandbox_proxy = get_recording_proxy(task_id) or get_sandbox_proxy(task_id)
             qa_result: QARunResult = await _run_qa_agent(
                 code_edit=state.code_edit,
                 sandbox_manager=sandbox_proxy or sandbox,
@@ -1479,6 +2166,31 @@ async def run_qa(state: OrchestratorState) -> dict[str, Any]:
                 span_id=qa_span_id,
                 parent_span_id=supervisor_span_id,
             )
+        except ValidationError as ve:
+            # Record Pydantic validation failure for uncertainty escalation
+            logger.warning(
+                "QA output failed Pydantic validation for task %s: %s",
+                task_id, ve,
+            )
+            tracing.update_span(
+                trace_id=trace_id,
+                span_id=qa_span_id or "",
+                output_data={"error": f"ValidationError: {ve}"[:500]},
+                end_time=datetime.now(UTC),
+                level="ERROR",
+            )
+            escalation_update = _record_pydantic_failure(
+                agent_name="qa",
+                step_index=state.step_index,
+                state=state,
+            )
+            if escalation_update is not None:
+                return {**escalation_update}
+            return {
+                "errors": [f"QA validation failed: {ve}"],
+                "outcome": "sandbox_failure",
+                "status": "failed",
+            }
         except Exception as exc:
             logger.error("QA agent failed for task %s: %s", task_id, exc)
             tracing.update_span(
@@ -1550,12 +2262,35 @@ async def run_qa(state: OrchestratorState) -> dict[str, Any]:
             "status": "failed",
         }
 
+    # Record successful Pydantic validation (resets failure counter)
+    success_update = _record_pydantic_success(
+        agent_name="qa",
+        step_index=state.step_index,
+        state=state,
+    )
+
+    # Process recorded tool calls for loop detection + uncertainty
+    tool_recordings_update = await _process_tool_call_recordings(
+        agent_name="qa",
+        step_index=state.step_index,
+        state=state,
+        trace_id=trace_id,
+        parent_span_id=supervisor_span_id,
+    )
+    if tool_recordings_update is not None and tool_recordings_update.get("outcome") in (
+        "loop_detected",
+        "uncertainty_escalation",
+    ):
+        return {**tool_recordings_update, **success_update}
+
     return {
         "test_report": report,
         "total_cost_usd": new_total_cost,
         "total_tokens_in": state.total_tokens_in + tokens_in,
         "total_tokens_out": state.total_tokens_out + tokens_out,
         "total_tokens_cached": state.total_tokens_cached + cached_tokens,
+        **success_update,
+        **(tool_recordings_update or {}),
     }
 
 

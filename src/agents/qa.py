@@ -146,7 +146,14 @@ You MUST produce a TestReport with:
 
 RULES:
 - Your output MUST be a valid TestReport. Do NOT include free-form text.
-- Use the sandbox_write_file tool to write test files into the sandbox.
+- Include the FULL content of each generated test file in the
+  ``generated_test_contents`` field (map of file_path → source code).
+  This is CRITICAL: if you cannot use sandbox_write_file (e.g. when
+  called via chat_with_cache without tool access), the orchestrator
+  will write files from generated_test_contents to the sandbox.
+- Also list each file path in ``generated_test_files`` (for traceability).
+- If you DO have tool access, use sandbox_write_file to write test files
+  into the sandbox AND populate generated_test_contents as a backup.
 - Use the sandbox_run_tests tool to execute the test suite.
 - The number of entries in failed_test_names MUST exactly equal the `failed` count.
   For example, if failed=2, failed_test_names must have exactly 2 entries.
@@ -496,16 +503,38 @@ async def run_qa(
             llm_result.usage_output = getattr(result.usage, "response_tokens", 0) or 0
 
     # ── Write generated test files to sandbox ───────────────────
-    if sandbox_manager is not None and report.generated_test_files:
-        for test_file in report.generated_test_files:
+    # When chat_with_cache is used, the LLM cannot invoke tools, so
+    # test file content is carried in generated_test_contents.
+    # The orchestrator writes each entry via sandbox_write_file.
+    if sandbox_manager is not None and report.generated_test_contents:
+        for test_file_path, test_file_content in report.generated_test_contents.items():
             try:
-                # The LLM returns file paths; we write placeholder content
-                # since the actual content was part of the LLM's reasoning.
-                # In practice, the LLM uses sandbox_write_file tool.
-                pass  # Test files are written via the LLM tool calls
+                await sandbox_manager.write_file(test_file_path, test_file_content)
+                logger.info(
+                    "Wrote generated test file from generated_test_contents: %s",
+                    test_file_path,
+                )
             except Exception as exc:
                 logger.warning(
-                    "Failed to write generated test file %s: %s", test_file, exc,
+                    "Failed to write generated test file %s: %s", test_file_path, exc,
+                )
+        # Ensure generated_test_files list is consistent with generated_test_contents
+        content_paths = set(report.generated_test_contents.keys())
+        listed_paths = set(report.generated_test_files)
+        missing_from_list = content_paths - listed_paths
+        if missing_from_list:
+            # Add any paths that are in contents but missing from the list
+            try:
+                report = TestReport(
+                    passed=report.passed,
+                    failed=report.failed,
+                    failed_test_names=report.failed_test_names,
+                    generated_test_files=report.generated_test_files + list(missing_from_list),
+                    generated_test_contents=report.generated_test_contents,
+                )
+            except ValidationError:
+                logger.warning(
+                    "Could not reconcile generated_test_files with generated_test_contents"
                 )
 
     # ── Run tests in sandbox and reconcile ──────────────────────
@@ -523,6 +552,7 @@ async def run_qa(
                     failed=actual_failed,
                     failed_test_names=actual_failed_names,
                     generated_test_files=report.generated_test_files,
+                    generated_test_contents=report.generated_test_contents,
                 )
             except ValidationError:
                 # If actual counts don't validate, keep the LLM report

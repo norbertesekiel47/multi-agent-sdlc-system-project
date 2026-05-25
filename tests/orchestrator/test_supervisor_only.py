@@ -799,6 +799,13 @@ class TestSupervisorOnlyGraphExecution:
         VAL-RETRY-002: Third failure triggers escalation, not a fourth attempt.
         VAL-RETRY-004: Retry exhaustion halts the task graph.
         The halt_retry_exhausted node now triggers an HITL interrupt.
+
+        NOTE: Each CodeEdit uses a UNIQUE diff_hash so that the
+        same_fix_rejected_twice uncertainty trigger does NOT fire
+        before the retry budget is exhausted.  (If the same hash
+        were reused, uncertainty escalation would fire after 2
+        rejections, which is correct per §2.9 but would prevent
+        reaching the retry_budget_exhausted path in this test.)
         """
         from contextlib import ExitStack
         from unittest.mock import patch
@@ -815,22 +822,27 @@ class TestSupervisorOnlyGraphExecution:
             rationale="The subtract function returns wrong results",
             approach="Fix the subtraction logic",
         )
-        mock_edit = CodeEdit(
-            diff=_SAMPLE_DIFF,
-            touched_files=["src/calculator.py"],
-            diff_hash="hash1",
-        )
-        mock_coder_result = CoderRunResult(
-            edit=mock_edit,
-            tokens_in=1500,
-            tokens_out=500,
-            cached_tokens=800,
-            cost_usd=Decimal("0.05"),
-        )
+        # Use a call counter to produce unique diff hashes per coder call
+        coder_call_count = 0
+
+        async def _mock_coder_fn(*args: object, **kwargs: object) -> object:
+            nonlocal coder_call_count
+            coder_call_count += 1
+            return CoderRunResult(
+                edit=CodeEdit(
+                    diff=_SAMPLE_DIFF,
+                    touched_files=["src/calculator.py"],
+                    diff_hash=f"hash_attempt_{coder_call_count}",  # unique per attempt
+                ),
+                tokens_in=1500,
+                tokens_out=500,
+                cached_tokens=800,
+                cost_usd=Decimal("0.05"),
+            )
+
         mock_review_reject = ReviewResult(
             verdict="reject_with_changes",
             issues=["Still not fixed"],
-            diff_hash="hash1",
         )
         mock_reviewer_result = ReviewerRunResult(
             review=mock_review_reject,
@@ -845,7 +857,7 @@ class TestSupervisorOnlyGraphExecution:
                 patch("src.agents.planner.run_planner", return_value=mock_plan)
             )
             mock_coder = stack.enter_context(
-                patch("src.agents.coder.run_coder", return_value=mock_coder_result)
+                patch("src.agents.coder.run_coder", side_effect=_mock_coder_fn)
             )
             stack.enter_context(
                 patch(

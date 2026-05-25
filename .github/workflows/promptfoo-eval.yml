@@ -6,12 +6,14 @@ on:
     paths:
       # Run on changes to agent prompts or eval config
       - 'src/agents/**'
+      - 'prompts/**'
       - 'evals/**'
       - '.github/workflows/promptfoo-eval.yml'
   pull_request:
     branches: [main]
     paths:
       - 'src/agents/**'
+      - 'prompts/**'
       - 'evals/**'
       - '.github/workflows/promptfoo-eval.yml'
 
