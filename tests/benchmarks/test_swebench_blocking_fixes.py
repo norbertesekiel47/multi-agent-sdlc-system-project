@@ -146,7 +146,12 @@ class TestRunnerPassesImageToSandboxManager:
         runner.image_cache = mock_cache
 
         with patch.object(
-            runner, "_invoke_orchestrator", return_value=("", 0.0),
+            runner, "_invoke_orchestrator", return_value={
+                "patch": "", "cost_usd": 0.0, "cost_caching_on_usd": 0.0,
+                "cost_caching_off_usd": 0.0, "total_tokens_in": 0,
+                "total_tokens_out": 0, "total_tokens_cached": 0,
+                "hitl_escalations": [], "retry_count": 0, "peer_handoff_count": 0,
+            },
         ) as mock_invoke:
             await runner.run_instance(instance)
 
@@ -411,16 +416,28 @@ class TestRunnerBranchesOnTopology:
             mock_build_so.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_hybrid_topology_raises_not_implemented(self) -> None:
-        """hybrid topology raises NotImplementedError (not yet M4)."""
+    async def test_hybrid_topology_uses_build_hybrid_graph(self) -> None:
+        """hybrid topology selects build_hybrid_graph (M6: now implemented)."""
         runner, mocks = _make_runner_with_mocked_orch_deps(topology="hybrid")
         instance = _make_instance()
         expected_image = _swebench_image_name(instance.instance_id)
 
+        mock_sandbox = mocks["sandbox"]
+        mock_sandbox.setup = AsyncMock()
+        mock_sandbox.teardown = AsyncMock()
+        mock_sandbox.run_command = AsyncMock()
+        mock_sandbox.workspace_dir = "/workspace"
+
+        mock_gh_client = mocks["gh_client"]
+        mock_gh_client.clone = MagicMock()
+
+        mock_state = mocks["state"]
+        mock_state.model_dump = MagicMock(return_value={})
+
         with (
             patch(
                 "src.sandbox.manager.SandboxManager",
-                return_value=mocks["sandbox"],
+                return_value=mock_sandbox,
             ),
             patch(
                 "src.memory.episodic.store.EpisodicStore",
@@ -430,28 +447,38 @@ class TestRunnerBranchesOnTopology:
                 "src.memory.semantic.store.SemanticStore",
                 return_value=mocks["semantic_store"],
             ),
-            patch("src.orchestrator.supervisor_only.register_sandbox"),
-            patch("src.orchestrator.supervisor_only.register_store"),
-            patch("src.orchestrator.supervisor_only.register_semantic_store"),
-            patch("src.orchestrator.supervisor_only.unregister_sandbox"),
-            patch("src.orchestrator.supervisor_only.unregister_store"),
-            patch("src.orchestrator.supervisor_only.unregister_semantic_store"),
+            patch("src.orchestrator.hybrid.register_sandbox"),
+            patch("src.orchestrator.hybrid.register_store"),
+            patch("src.orchestrator.hybrid.register_semantic_store"),
+            patch("src.orchestrator.hybrid.register_guardrail"),
+            patch("src.orchestrator.hybrid.unregister_sandbox"),
+            patch("src.orchestrator.hybrid.unregister_store"),
+            patch("src.orchestrator.hybrid.unregister_semantic_store"),
+            patch("src.orchestrator.hybrid.unregister_guardrail"),
             patch(
                 "src.github_client.client.GitHubClient",
-                return_value=mocks["gh_client"],
+                return_value=mock_gh_client,
             ),
             patch(
                 "src.orchestrator.OrchestratorState",
-                return_value=mocks["state"],
+                return_value=mock_state,
             ),
-            pytest.raises((NotImplementedError, ValueError)),
+            patch("src.orchestrator.hybrid.build_hybrid_graph") as mock_build_hybrid,
+            patch("src.guardrails.middleware.GuardrailMiddleware"),
         ):
-            await runner._invoke_orchestrator(
+            mock_graph = MagicMock()
+            mock_graph.compile.return_value = MagicMock()
+            mock_graph.compile.return_value.ainvoke = AsyncMock(return_value={})
+            mock_build_hybrid.return_value = mock_graph
+
+            result = await runner._invoke_orchestrator(
                 instance=instance,
                 repo_url=f"https://github.com/{instance.repo}",
                 task_id="test-task-001",
                 image_name=expected_image,
             )
+
+            mock_build_hybrid.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_single_agent_does_not_call_supervisor_only(self) -> None:

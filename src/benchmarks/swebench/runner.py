@@ -233,23 +233,37 @@ class SweBenchRunner:
 
             # Invoke the orchestrator programmatically
             # The orchestrator runs the full pipeline and produces a patch
-            patch, cost_usd = await self._invoke_orchestrator(
+            orch_result = await self._invoke_orchestrator(
                 instance=instance,
                 repo_url=repo_url,
                 task_id=task_id,
                 image_name=image_name,
             )
 
+            patch = orch_result.get("patch", "")
+            cost_usd = orch_result.get("cost_usd", 0.0)
+            cost_caching_on_usd = orch_result.get("cost_caching_on_usd", cost_usd)
+            cost_caching_off_usd = orch_result.get("cost_caching_off_usd", cost_usd)
+            total_tokens_in = orch_result.get("total_tokens_in", 0)
+            total_tokens_out = orch_result.get("total_tokens_out", 0)
+            total_tokens_cached = orch_result.get("total_tokens_cached", 0)
+            hitl_escalations = orch_result.get("hitl_escalations", [])
+            retry_count = orch_result.get("retry_count", 0)
+            peer_handoff_count = orch_result.get("peer_handoff_count", 0)
+
             duration = time.monotonic() - start_time
             status = "success" if patch else "failed"
             error = None if patch else "Orchestrator returned empty patch"
 
             logger.info(
-                "Instance %s completed: status=%s, cost=$%.4f, duration=%.1fs",
+                "Instance %s completed: status=%s, cost=$%.4f, duration=%.1fs, tokens=%d/%d/%d",
                 instance_id,
                 status,
                 cost_usd,
                 duration,
+                total_tokens_in,
+                total_tokens_out,
+                total_tokens_cached,
             )
 
             return {
@@ -258,8 +272,16 @@ class SweBenchRunner:
                 "status": status,
                 "error": error,
                 "cost_usd": cost_usd,
+                "cost_caching_on_usd": cost_caching_on_usd,
+                "cost_caching_off_usd": cost_caching_off_usd,
+                "total_tokens_in": total_tokens_in,
+                "total_tokens_out": total_tokens_out,
+                "total_tokens_cached": total_tokens_cached,
                 "duration_seconds": duration,
                 "container_id": container_id,
+                "hitl_escalations": hitl_escalations,
+                "retry_count": retry_count,
+                "peer_handoff_count": peer_handoff_count,
             }
 
         except Exception as exc:
@@ -271,8 +293,16 @@ class SweBenchRunner:
                 "status": "error",
                 "error": str(exc),
                 "cost_usd": 0.0,
+                "cost_caching_on_usd": 0.0,
+                "cost_caching_off_usd": 0.0,
+                "total_tokens_in": 0,
+                "total_tokens_out": 0,
+                "total_tokens_cached": 0,
                 "duration_seconds": duration,
                 "container_id": container_id,
+                "hitl_escalations": [],
+                "retry_count": 0,
+                "peer_handoff_count": 0,
             }
 
     async def _invoke_orchestrator(
@@ -282,13 +312,25 @@ class SweBenchRunner:
         task_id: str,
         *,
         image_name: str,
-    ) -> tuple[str, float]:
+    ) -> dict[str, Any]:
         """Invoke the orchestrator with the instance's repo URL and issue text.
 
-        Selects the appropriate graph builder based on ``self.config.topology``
-        (no longer hardcoded to supervisor_only).  Passes the SWE-bench
-        per-instance Docker image to SandboxManager so the sandbox uses the
-        correct environment instead of the default sandbox-base image.
+        Selects the appropriate graph builder based on ``self.config.topology``.
+        Passes the SWE-bench per-instance Docker image to SandboxManager so
+        the sandbox uses the correct environment instead of the default
+        sandbox-base image.
+
+        Returns a dict with all captured metrics including:
+            - patch: str
+            - cost_usd: float
+            - cost_caching_on_usd: float
+            - cost_caching_off_usd: float
+            - total_tokens_in: int
+            - total_tokens_out: int
+            - total_tokens_cached: int
+            - hitl_escalations: list of {cause, agent} dicts
+            - retry_count: int
+            - peer_handoff_count: int
 
         Args:
             instance: The SWE-bench instance.
@@ -298,10 +340,9 @@ class SweBenchRunner:
                 (e.g. ``swebench/sweb.eval.x86_64.django_django-12345:latest``).
 
         Returns:
-            Tuple of (patch_string, cost_usd).
+            Dict with patch, cost data, tokens, HITL escalations, etc.
 
         Raises:
-            NotImplementedError: If the topology is ``hybrid`` (M4).
             ValueError: If the topology is unknown.
         """
         from langgraph.types import RunnableConfig  # type: ignore[attr-defined]
@@ -309,28 +350,65 @@ class SweBenchRunner:
         from src.memory.episodic.store import EpisodicStore
         from src.memory.semantic.store import SemanticStore
         from src.orchestrator import OrchestratorState, build_single_agent_graph
-        from src.orchestrator.supervisor_only import (
-            build_supervisor_only_graph,
-            register_sandbox,
-            register_semantic_store,
-            register_store,
-            unregister_sandbox,
-            unregister_semantic_store,
-            unregister_store,
-        )
         from src.sandbox.manager import SandboxManager
 
         # ── Topology routing ───────────────────────────────────────
         if self.config.topology == "supervisor_only":
-            build_graph = build_supervisor_only_graph
-        elif self.config.topology == "single_agent":
-            build_graph = build_single_agent_graph
-        elif self.config.topology == "hybrid":
-            msg = (
-                "Hybrid topology is not yet implemented — "
-                "requires Coder⇄Reviewer peer handoff (M4)."
+            from src.orchestrator.supervisor_only import (
+                build_supervisor_only_graph,
+                register_guardrail,
+                register_sandbox,
+                register_semantic_store,
+                register_store,
+                unregister_guardrail,
+                unregister_sandbox,
+                unregister_semantic_store,
+                unregister_store,
             )
-            raise NotImplementedError(msg)
+
+            build_graph = build_supervisor_only_graph
+        elif self.config.topology == "hybrid":
+            from src.orchestrator.hybrid import (
+                build_hybrid_graph,
+                register_guardrail,
+                register_sandbox,
+                register_semantic_store,
+                register_store,
+                unregister_guardrail,
+                unregister_sandbox,
+                unregister_semantic_store,
+                unregister_store,
+            )
+
+            build_graph = build_hybrid_graph
+        elif self.config.topology == "single_agent":
+            # Single agent doesn't need sandbox/store registration
+            build_graph = build_single_agent_graph
+
+            # Define no-op register/unregister for single_agent path
+            def register_sandbox(tid: str, sb: SandboxManager) -> None:  # type: ignore[misc]  # noqa: ANN001
+                pass
+
+            def register_store(tid: str, st: EpisodicStore) -> None:  # type: ignore[misc]  # noqa: ANN001
+                pass
+
+            def register_semantic_store(tid: str, ss: SemanticStore) -> None:  # type: ignore[misc]  # noqa: ANN001
+                pass
+
+            def register_guardrail(tid: str, g: Any) -> None:  # type: ignore[misc]  # noqa: ANN001
+                pass
+
+            def unregister_sandbox(tid: str) -> None:  # type: ignore[misc]  # noqa: ANN001
+                pass
+
+            def unregister_store(tid: str) -> EpisodicStore | None:  # type: ignore[misc]  # noqa: ANN001
+                return None
+
+            def unregister_semantic_store(tid: str) -> SemanticStore | None:  # type: ignore[misc]  # noqa: ANN001
+                return None
+
+            def unregister_guardrail(tid: str) -> Any:  # type: ignore[misc]  # noqa: ANN001
+                return None
         else:
             msg = f"Unknown topology: {self.config.topology!r}"
             raise ValueError(msg)
@@ -344,9 +422,14 @@ class SweBenchRunner:
         register_semantic_store(task_id, semantic_store)
 
         # Create sandbox with the SWE-bench per-instance Docker image
-        # (Fix 1: was hardcoded to default sandbox-base; now uses image_name)
         sandbox = SandboxManager(task_id=task_id, image=image_name)
         register_sandbox(task_id, sandbox)
+
+        # Register guardrail middleware (VAL-GUARDRAIL-001..011)
+        from src.guardrails.middleware import GuardrailMiddleware
+
+        guardrail = GuardrailMiddleware()
+        register_guardrail(task_id, guardrail)
 
         try:
             # Setup sandbox (clone repo, etc.)
@@ -380,7 +463,7 @@ class SweBenchRunner:
             os.environ["LLM_TEMPERATURE"] = str(self.config.temperature)
 
             try:
-                # Build and run the graph (Fix 2: topology-dependent builder)
+                # Build and run the graph
                 graph = build_graph()
                 compiled = graph.compile()
                 config_dict: RunnableConfig = {"configurable": {"thread_id": task_id}}
@@ -390,16 +473,134 @@ class SweBenchRunner:
                     config=config_dict,
                 )
 
-                # Extract the patch from the result
+                # Extract the patch and metrics from the result
                 patch = ""
                 cost_usd = 0.0
+                cost_caching_on_usd = 0.0
+                cost_caching_off_usd = 0.0
+                total_tokens_in = 0
+                total_tokens_out = 0
+                total_tokens_cached = 0
+                hitl_escalations: list[dict[str, str]] = []
+                retry_count = 0
+                peer_handoff_count = 0
 
                 if isinstance(result, dict):
-                    patch = result.get("patch", result.get("code_edit", {}).get("diff", "")) or ""
+                    patch = result.get("patch", "") or ""
+                    if not patch and result.get("code_edit"):
+                        ce = result["code_edit"]
+                        if isinstance(ce, dict):
+                            patch = ce.get("diff", "")
+                        elif hasattr(ce, "diff"):
+                            patch = ce.diff
+
                     cost_val = result.get("total_cost_usd", 0)
                     cost_usd = float(cost_val) if cost_val else 0.0
 
-                return patch, cost_usd
+                    # Token tracking
+                    total_tokens_in = int(result.get("total_tokens_in", 0))
+                    total_tokens_out = int(result.get("total_tokens_out", 0))
+                    total_tokens_cached = int(result.get("total_tokens_cached", 0))
+
+                    # Retry count
+                    retry_count = int(result.get("retry_count", 0))
+
+                    # Peer handoff count (hybrid only)
+                    peer_handoff_count = int(result.get("peer_handoff_count", 0))
+
+                    # Compute cost_caching_off_usd:
+                    # If we have cached tokens, estimate what the cost would be
+                    # without caching.  Cached tokens are charged at a reduced rate
+                    # (typically 10% of full price for Anthropic, 50% for DeepSeek).
+                    # We use a conservative 50% discount factor for estimation.
+                    if total_tokens_cached > 0 and cost_usd > 0:
+                        # Estimate the full-price cost: if cost_usd reflects the
+                        # cached discount, the uncached cost is higher.
+                        # DeepSeek auto-cache gives ~50% discount on
+                        # cached tokens.
+                        # We compute:
+                        # cost_off = cost_on + cached_ratio * cost_on
+                        # Simplified: cost_off ≈ cost_on * (1 + cached_ratio * discount_factor)
+                        total_prompt = total_tokens_in
+                        if total_prompt > 0:
+                            cached_ratio = total_tokens_cached / total_prompt
+                            # DeepSeek auto-cache discount is ~50%, so uncached
+                            # tokens would cost 2x what cached tokens cost.
+                            # cost_on already reflects the discount, so:
+                            cost_caching_on_usd = cost_usd
+                            cost_caching_off_usd = cost_usd * (1.0 + cached_ratio)
+                        else:
+                            cost_caching_on_usd = cost_usd
+                            cost_caching_off_usd = cost_usd
+                    else:
+                        cost_caching_on_usd = cost_usd
+                        cost_caching_off_usd = cost_usd
+
+                elif isinstance(result, OrchestratorState):
+                    patch = result.code_edit.diff if result.code_edit else ""
+                    cost_usd = float(result.total_cost_usd)
+                    total_tokens_in = result.total_tokens_in
+                    total_tokens_out = result.total_tokens_out
+                    total_tokens_cached = result.total_tokens_cached
+                    retry_count = result.retry_count
+                    peer_handoff_count = result.peer_handoff_count
+
+                    if total_tokens_cached > 0 and cost_usd > 0:
+                        total_prompt = total_tokens_in
+                        if total_prompt > 0:
+                            cached_ratio = total_tokens_cached / total_prompt
+                            cost_caching_on_usd = cost_usd
+                            cost_caching_off_usd = cost_usd * (1.0 + cached_ratio)
+                        else:
+                            cost_caching_on_usd = cost_usd
+                            cost_caching_off_usd = cost_usd
+                    else:
+                        cost_caching_on_usd = cost_usd
+                        cost_caching_off_usd = cost_usd
+
+                # Collect HITL escalations from the episodic store
+                try:
+                    from uuid import UUID
+
+                    outcomes = await episodic_store.get_outcomes_for_task(
+                        UUID(task_id)
+                    )
+                    valid_causes = {
+                        "loop_detected",
+                        "uncertainty_escalation",
+                        "retry_budget_exhausted",
+                        "cost_budget_exhausted",
+                        "guardrail_block",
+                        "manual",
+                    }
+                    for o in outcomes:
+                        if o.outcome in valid_causes:
+                            detail = o.detail or {}
+                            trigger = detail.get("trigger", o.outcome)
+                            agent = detail.get("triggering_agent", detail.get("agent", "unknown"))
+                            hitl_escalations.append({
+                                "cause": o.outcome,
+                                "trigger": trigger,
+                                "agent": agent,
+                            })
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to fetch HITL escalations for %s: %s",
+                        task_id, exc,
+                    )
+
+                return {
+                    "patch": patch,
+                    "cost_usd": cost_usd,
+                    "cost_caching_on_usd": cost_caching_on_usd,
+                    "cost_caching_off_usd": cost_caching_off_usd,
+                    "total_tokens_in": total_tokens_in,
+                    "total_tokens_out": total_tokens_out,
+                    "total_tokens_cached": total_tokens_cached,
+                    "hitl_escalations": hitl_escalations,
+                    "retry_count": retry_count,
+                    "peer_handoff_count": peer_handoff_count,
+                }
 
             finally:
                 # Restore temperature
@@ -418,3 +619,4 @@ class SweBenchRunner:
             unregister_sandbox(task_id)
             unregister_store(task_id)
             unregister_semantic_store(task_id)
+            unregister_guardrail(task_id)

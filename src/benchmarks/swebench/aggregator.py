@@ -195,12 +195,53 @@ class Aggregator:
                 cost_off_values.append(avg_off)
                 cost_on_values.append(avg_on)
 
+                # Per-instance token totals
+                total_tokens_in_list = [
+                    r.get("total_tokens_in", 0) for r in run_results
+                ]
+                total_tokens_out_list = [
+                    r.get("total_tokens_out", 0) for r in run_results
+                ]
+                total_tokens_cached_list = [
+                    r.get("total_tokens_cached", 0) for r in run_results
+                ]
+                avg_tokens_in = (
+                    _mean([float(v) for v in total_tokens_in_list])
+                    if total_tokens_in_list else 0.0
+                )
+                avg_tokens_out = (
+                    _mean([float(v) for v in total_tokens_out_list])
+                    if total_tokens_out_list else 0.0
+                )
+                avg_tokens_cached = (
+                    _mean([float(v) for v in total_tokens_cached_list])
+                    if total_tokens_cached_list else 0.0
+                )
+
+                # Per-instance duration averages
+                durations = [r.get("duration_seconds", 0.0) for r in run_results]
+                avg_duration = _mean([float(v) for v in durations]) if durations else 0.0
+
+                # Per-instance retry count averages
+                retries = [r.get("retry_count", 0) for r in run_results]
+                avg_retries = _mean([float(v) for v in retries]) if retries else 0.0
+
+                # Per-instance peer handoff counts (hybrid only)
+                handoffs = [r.get("peer_handoff_count", 0) for r in run_results]
+                avg_handoffs = _mean([float(v) for v in handoffs]) if handoffs else 0.0
+
                 # Build instance output dict
                 instance_out: dict[str, Any] = {
                     "instance_id": ir.get("instance_id", "unknown"),
                     "success_rate": inst_mean,
                     "avg_cost_caching_off_usd": avg_off,
                     "avg_cost_caching_on_usd": avg_on,
+                    "avg_total_tokens_in": avg_tokens_in,
+                    "avg_total_tokens_out": avg_tokens_out,
+                    "avg_total_tokens_cached": avg_tokens_cached,
+                    "avg_duration_seconds": avg_duration,
+                    "avg_retry_count": avg_retries,
+                    "avg_peer_handoff_count": avg_handoffs,
                     "hitl_escalations": hitl_escalations,
                 }
                 instances_out.append(instance_out)
@@ -215,6 +256,37 @@ class Aggregator:
             cell_cost_off = _mean(cost_off_values) if cost_off_values else 0.0
             cell_cost_on = _mean(cost_on_values) if cost_on_values else 0.0
 
+            # Cell-level token averages
+            cell_tokens_in = _mean(
+                [inst.get("avg_total_tokens_in", 0.0) for inst in instances_out]
+            )
+            cell_tokens_out = _mean(
+                [inst.get("avg_total_tokens_out", 0.0) for inst in instances_out]
+            )
+            cell_tokens_cached = _mean(
+                [inst.get("avg_total_tokens_cached", 0.0)
+                 for inst in instances_out]
+            )
+
+            # Cell-level duration average
+            cell_duration = _mean([inst.get("avg_duration_seconds", 0.0) for inst in instances_out])
+
+            # Cell-level retry average
+            cell_retries = _mean([inst.get("avg_retry_count", 0.0) for inst in instances_out])
+
+            # Cell-level peer handoff average
+            cell_handoffs = _mean(
+                [inst.get("avg_peer_handoff_count", 0.0)
+                 for inst in instances_out]
+            )
+
+            # Cell-level HITL escalation summary
+            cell_hitl_causes: dict[str, int] = {}
+            for inst in instances_out:
+                for esc in inst.get("hitl_escalations", []):
+                    cause = esc.get("cause", "unknown")
+                    cell_hitl_causes[cause] = cell_hitl_causes.get(cause, 0) + 1
+
             cell: dict[str, Any] = {
                 "topology": topology,
                 "model": model,
@@ -225,6 +297,13 @@ class Aggregator:
                 "ci_high": ci_high,
                 "cost_caching_off_usd": cell_cost_off,
                 "cost_caching_on_usd": cell_cost_on,
+                "avg_total_tokens_in": cell_tokens_in,
+                "avg_total_tokens_out": cell_tokens_out,
+                "avg_total_tokens_cached": cell_tokens_cached,
+                "avg_duration_seconds": cell_duration,
+                "avg_retry_count": cell_retries,
+                "avg_peer_handoff_count": cell_handoffs,
+                "hitl_escalation_summary": cell_hitl_causes,
                 "instances": instances_out,
             }
             cells.append(cell)
@@ -302,16 +381,22 @@ class Aggregator:
         lines.append("")
         header = (
             "| topology | model | n | mean | variance | 95% CI | "
-            "cost_caching_off_usd | cost_caching_on_usd |"
+            "cost_caching_off_usd | cost_caching_on_usd | "
+            "avg_tokens_in | avg_tokens_out | avg_cached | "
+            "avg_duration_s | avg_retries | avg_handoffs | "
+            "hitl_escalations |"
         )
         separator = (
-            "| --- | --- | --- | --- | --- | --- | --- | --- |"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | "
+            "--- | --- | --- | --- | --- | --- | --- |"
         )
         lines.append(header)
         lines.append(separator)
 
         for cell in results_doc.get("cells", []):
             ci_str = f"[{cell['ci_low']:.4f}, {cell['ci_high']:.4f}]"
+            esc_summary = cell.get("hitl_escalation_summary", {})
+            esc_str = ", ".join(f"{k}:{v}" for k, v in esc_summary.items()) or "—"
             row = (
                 f"| {cell['topology']} "
                 f"| {cell['model']} "
@@ -320,7 +405,14 @@ class Aggregator:
                 f"| {cell['variance']:.6f} "
                 f"| {ci_str} "
                 f"| {cell['cost_caching_off_usd']:.4f} "
-                f"| {cell['cost_caching_on_usd']:.4f} |"
+                f"| {cell['cost_caching_on_usd']:.4f} "
+                f"| {cell.get('avg_total_tokens_in', 0):.0f} "
+                f"| {cell.get('avg_total_tokens_out', 0):.0f} "
+                f"| {cell.get('avg_total_tokens_cached', 0):.0f} "
+                f"| {cell.get('avg_duration_seconds', 0):.1f} "
+                f"| {cell.get('avg_retry_count', 0):.2f} "
+                f"| {cell.get('avg_peer_handoff_count', 0):.2f} "
+                f"| {esc_str} |"
             )
             lines.append(row)
 
@@ -335,9 +427,11 @@ class Aggregator:
             lines.append("")
             inst_header = (
                 "| instance_id | success_rate | "
-                "avg_cost_caching_off_usd | avg_cost_caching_on_usd | hitl_escalations |"
+                "avg_cost_caching_off_usd | avg_cost_caching_on_usd | "
+                "avg_tokens_in | avg_tokens_out | avg_cached | "
+                "avg_duration_s | avg_retries | hitl_escalations |"
             )
-            inst_sep = "| --- | --- | --- | --- | --- |"
+            inst_sep = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
             lines.append(inst_header)
             lines.append(inst_sep)
 
@@ -349,8 +443,13 @@ class Aggregator:
                 row = (
                     f"| {inst['instance_id']} "
                     f"| {inst['success_rate']:.4f} "
-                    f"| {inst['avg_cost_caching_off_usd']:.4f} "
-                    f"| {inst['avg_cost_caching_on_usd']:.4f} "
+                    f"| {inst.get('avg_cost_caching_off_usd', 0):.4f} "
+                    f"| {inst.get('avg_cost_caching_on_usd', 0):.4f} "
+                    f"| {inst.get('avg_total_tokens_in', 0):.0f} "
+                    f"| {inst.get('avg_total_tokens_out', 0):.0f} "
+                    f"| {inst.get('avg_total_tokens_cached', 0):.0f} "
+                    f"| {inst.get('avg_duration_seconds', 0):.1f} "
+                    f"| {inst.get('avg_retry_count', 0):.2f} "
                     f"| {esc_str} |"
                 )
                 lines.append(row)

@@ -8,11 +8,20 @@ Components:
 - Evaluator wrapper: runs official swebench evaluator on captured patches
 - Aggregator: computes mean/variance/95% CI across runs, persists JSON + Markdown
 
-CLI entry point: ``python -m sdlc_swarm.benchmarks.swebench``
+CLI entry point: ``python -m src.benchmarks.swebench``
+
+Matrix mode (M6): ``python -m src.benchmarks.swebench --matrix --slice 30 --runs 3``
+Runs all 3 topologies × instances × N=3 and captures comprehensive metrics.
 """
 
 from src.benchmarks.swebench.aggregator import Aggregator
 from src.benchmarks.swebench.loader import InstanceLoader
-from src.benchmarks.swebench.models import SweBenchInstance, SweBenchResult
+from src.benchmarks.swebench.models import RunConfig, SweBenchInstance, SweBenchResult
 
-__all__ = ["Aggregator", "InstanceLoader", "SweBenchInstance", "SweBenchResult"]
+__all__ = [
+    "Aggregator",
+    "InstanceLoader",
+    "RunConfig",
+    "SweBenchInstance",
+    "SweBenchResult",
+]

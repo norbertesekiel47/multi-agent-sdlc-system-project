@@ -456,7 +456,12 @@ class TestSweBenchRunner:
         runner.image_cache = mock_cache
 
         # Mock orchestrator invocation to return a simple patch
-        with patch.object(runner, "_invoke_orchestrator", return_value=("", 0.0)):
+        with patch.object(runner, "_invoke_orchestrator", return_value={
+            "patch": "", "cost_usd": 0.0, "cost_caching_on_usd": 0.0,
+            "cost_caching_off_usd": 0.0, "total_tokens_in": 0,
+            "total_tokens_out": 0, "total_tokens_cached": 0,
+            "hitl_escalations": [], "retry_count": 0, "peer_handoff_count": 0,
+        }):
             result = await runner.run_instance(sample_instance)
 
         assert result["instance_id"] == sample_instance.instance_id
@@ -489,7 +494,13 @@ class TestSweBenchRunner:
         # Mock orchestrator invocation
         with patch.object(
             runner, "_invoke_orchestrator",
-            return_value=(sample_patch, 0.05),
+            return_value={
+                "patch": sample_patch, "cost_usd": 0.05,
+                "cost_caching_on_usd": 0.05, "cost_caching_off_usd": 0.05,
+                "total_tokens_in": 5000, "total_tokens_out": 1500,
+                "total_tokens_cached": 0, "hitl_escalations": [],
+                "retry_count": 0, "peer_handoff_count": 0,
+            },
         ):
             result = await runner.run_instance(sample_instance)
 
@@ -506,7 +517,12 @@ class TestSweBenchRunner:
         mock_cache.ensure_image.return_value = "swebench/sweb.eval.x86_64.test:latest"
         runner.image_cache = mock_cache
 
-        with patch.object(runner, "_invoke_orchestrator", return_value=("", 0.0)):
+        with patch.object(runner, "_invoke_orchestrator", return_value={
+            "patch": "", "cost_usd": 0.0, "cost_caching_on_usd": 0.0,
+            "cost_caching_off_usd": 0.0, "total_tokens_in": 0,
+            "total_tokens_out": 0, "total_tokens_cached": 0,
+            "hitl_escalations": [], "retry_count": 0, "peer_handoff_count": 0,
+        }):
             result = await runner.run_instance(sample_instance)
 
         assert result["status"] == "failed"
@@ -850,7 +866,13 @@ class TestEndToEndPipeline:
 
         with patch.object(
             runner, "_invoke_orchestrator",
-            return_value=(sample_patch, 0.05),
+            return_value={
+                "patch": sample_patch, "cost_usd": 0.05,
+                "cost_caching_on_usd": 0.05, "cost_caching_off_usd": 0.05,
+                "total_tokens_in": 5000, "total_tokens_out": 1500,
+                "total_tokens_cached": 0, "hitl_escalations": [],
+                "retry_count": 0, "peer_handoff_count": 0,
+            },
         ):
             result = await runner.run_instance(instance)
 

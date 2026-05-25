@@ -655,6 +655,10 @@ class EpisodicStore:
     @staticmethod
     def _task_row_from_record(record: asyncpg.Record) -> TaskRow:
         """Map an asyncpg Record to a TaskRow."""
+        agent_costs = record.get("agent_costs")
+        if isinstance(agent_costs, str):
+            import json
+            agent_costs = json.loads(agent_costs)
         return TaskRow(
             id=record["id"],
             repo_url=record["repo_url"],
@@ -666,7 +670,7 @@ class EpisodicStore:
             total_tokens_in=record["total_tokens_in"],
             total_tokens_out=record["total_tokens_out"],
             total_tokens_cached=record["total_tokens_cached"],
-            agent_costs=record.get("agent_costs"),
+            agent_costs=agent_costs,
             hitl_decision=record["hitl_decision"],
             pr_url=record["pr_url"],
             started_at=record["started_at"],

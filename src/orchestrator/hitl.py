@@ -102,7 +102,7 @@ class _PostgresCheckpointerFactory:
     async def get(self) -> Any:
         """Return an initialized AsyncPostgresSaver."""
         if self._checkpointer is None:
-            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # type: ignore[import-not-found]
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
             self._checkpointer = AsyncPostgresSaver.from_conn_string(self._dsn)
             await self._checkpointer.setup()
