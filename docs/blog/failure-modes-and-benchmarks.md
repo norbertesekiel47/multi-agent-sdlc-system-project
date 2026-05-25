@@ -333,4 +333,3 @@ To reproduce: `python3 -m src.benchmarks.swebench --matrix --slice 30 --runs 3 -
 
 ---
 
-*SDLC-Swarm is open source. The full design spec, architecture, and all benchmark data are in the repository. For questions or to contribute, open an issue on GitHub.*
