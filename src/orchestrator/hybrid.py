@@ -409,10 +409,10 @@ async def run_reviewer_hybrid(state: OrchestratorState) -> dict[str, Any]:
         event_type="node_end",
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
         cost_usd=cost_usd,
         metadata={
             "agent_name": "reviewer",
-            "cached_tokens": cached_tokens,
             "verdict": review.verdict if review else None,
         },
     )
@@ -629,10 +629,10 @@ async def run_peer_coder(state: OrchestratorState) -> dict[str, Any]:
         event_type="node_end",
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
         cost_usd=cost_usd,
         metadata={
             "agent_name": "coder",
-            "cached_tokens": cached_tokens,
             "handoff_type": "peer",
         },
     )
@@ -1010,8 +1010,9 @@ async def _run_coder_supervisor(state: OrchestratorState) -> dict[str, Any]:
         event_type="node_end",
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
         cost_usd=cost_usd,
-        metadata={"agent_name": "coder", "cached_tokens": cached_tokens},
+        metadata={"agent_name": "coder"},
     )
 
     # Increment retry counter

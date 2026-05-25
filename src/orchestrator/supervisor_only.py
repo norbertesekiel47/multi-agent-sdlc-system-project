@@ -1327,6 +1327,7 @@ async def _emit_trace_event(
     metadata: dict[str, Any] | None = None,
     tokens_in: int = 0,
     tokens_out: int = 0,
+    cached_tokens: int = 0,
     cost_usd: Decimal = Decimal("0"),
 ) -> None:
     """Broadcast a trace event via the WebSocket broadcaster."""
@@ -1342,6 +1343,7 @@ async def _emit_trace_event(
             span_type=SpanType.SPAN,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+            cached_tokens=cached_tokens,
             cost_usd=cost_usd,
             metadata=metadata or {},
         )
@@ -1464,6 +1466,7 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
     cost_usd = Decimal("0")
     tokens_in = 0
     tokens_out = 0
+    cached_tokens = 0
 
     try:
         from src.agents.planner import run_planner as _run_planner_agent
@@ -1543,6 +1546,7 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
         event_type="node_end",
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
         cost_usd=cost_usd,
         metadata={"agent_name": "planner"},
     )
@@ -1767,8 +1771,9 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
         event_type="node_end",
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
         cost_usd=cost_usd,
-        metadata={"agent_name": "coder", "cached_tokens": cached_tokens},
+        metadata={"agent_name": "coder"},
     )
 
     # Increment retry counter
@@ -1992,10 +1997,10 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
         event_type="node_end",
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
         cost_usd=cost_usd,
         metadata={
             "agent_name": "reviewer",
-            "cached_tokens": cached_tokens,
             "verdict": review.verdict if review else None,
         },
     )
@@ -2307,10 +2312,10 @@ async def run_qa(state: OrchestratorState) -> dict[str, Any]:
         event_type="node_end",
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
         cost_usd=cost_usd,
         metadata={
             "agent_name": "qa",
-            "cached_tokens": cached_tokens,
             "passed": report.passed if report else None,
             "failed": report.failed if report else None,
         },
