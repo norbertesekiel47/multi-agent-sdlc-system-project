@@ -9,7 +9,7 @@
 import React from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderWithProviders } from "../test-utils";
-import { TaskDetailContent } from "@/app/tasks/[id]/page";
+import { TaskDetailContent } from "@/components/task/task-detail-content";
 import { screen, waitFor, cleanup } from "@testing-library/react";
 
 afterEach(() => cleanup());
