@@ -541,9 +541,6 @@ def build(
     )
 
     try:
-        # Remove any existing artifact with the same tag
-        _kit_remove(tag)
-
         # Pack the ModelKit
         artifact_ref = _kit_pack(staging_dir, tag)
         logger.info("ModelKit packed: %s", artifact_ref)
