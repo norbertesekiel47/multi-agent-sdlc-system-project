@@ -24,9 +24,11 @@ const statusColors: Record<TaskStatus, string> = {
   failed: "bg-red-500/15 text-red-500",
 };
 
-function formatCost(cost: number | null): string {
+function formatCost(cost: number | string | null): string {
   if (cost === null || cost === undefined) return "—";
-  return `$${cost.toFixed(4)}`;
+  const numCost = typeof cost === "string" ? parseFloat(cost) : cost;
+  if (isNaN(numCost)) return "—";
+  return `$${numCost.toFixed(4)}`;
 }
 
 function formatTime(iso: string | null): string {

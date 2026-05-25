@@ -38,15 +38,24 @@ export function TaskSubmitForm() {
   const [topology, setTopology] = useState<Topology>("hybrid");
   const [errors, setErrors] = useState<FormErrors>({});
 
+  /** Canonicalize a repo URL: trim whitespace and strip .git suffix */
+  function canonicalizeRepoUrl(url: string): string {
+    const trimmed = url.trim();
+    if (trimmed.endsWith(".git")) {
+      return trimmed.slice(0, -4);
+    }
+    return trimmed;
+  }
+
   function validate(): boolean {
     const newErrors: FormErrors = {};
 
-    const trimmedUrl = repoUrl.trim();
-    if (!trimmedUrl) {
+    const canonicalUrl = canonicalizeRepoUrl(repoUrl);
+    if (!canonicalUrl) {
       newErrors.repo_url = "Repository URL is required";
     } else if (
-      !trimmedUrl.startsWith("https://") &&
-      !trimmedUrl.startsWith("http://")
+      !canonicalUrl.startsWith("https://") &&
+      !canonicalUrl.startsWith("http://")
     ) {
       newErrors.repo_url = "Please enter a valid URL starting with https://";
     }
@@ -71,7 +80,7 @@ export function TaskSubmitForm() {
 
     try {
       const result = await createTask.mutateAsync({
-        repo_url: repoUrl.trim(),
+        repo_url: canonicalizeRepoUrl(repoUrl),
         issue_number: parseInt(issueNumber.trim(), 10),
         issue_text: `Issue #${issueNumber.trim()}`,
         topology,

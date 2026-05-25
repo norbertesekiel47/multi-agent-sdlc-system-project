@@ -27,6 +27,8 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -67,6 +69,18 @@ app = FastAPI(
     version=__version__,
     docs_url="/docs",
     redoc_url="/redoc",
+)
+
+# CORS middleware — allow the Next.js dashboard (port 3101) to call the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3101",
+        "http://127.0.0.1:3101",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Register custom exception handlers (VAL-BACKEND-API-002)
@@ -321,7 +335,7 @@ async def hitl_decision(
     task_id: UUID,
     body: HITLDecisionRequest,
     store: EpisodicStore = Depends(get_store),  # noqa: B008
-) -> HITLDecisionResponse:
+) -> HITLDecisionResponse | JSONResponse:
     """Resolve an HITL interrupt for a task.
 
     VAL-HITL-CTRL-004: POST approve resumes the LangGraph.
@@ -339,8 +353,6 @@ async def hitl_decision(
     # VAL-HITL-CTRL-008: Decision already made (check BEFORE status
     # because after a decision, the status may have changed)
     if task.hitl_decision is not None:
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=409,
             content={
@@ -351,8 +363,6 @@ async def hitl_decision(
 
     # VAL-HITL-CTRL-009: Task must be in awaiting_hitl status
     if task.status != "awaiting_hitl":
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=409,
             content={
@@ -368,6 +378,8 @@ async def hitl_decision(
         # VAL-HITL-CTRL-004: Approve → resume LangGraph
         # VAL-HITL-CTRL-005: Approve → open_pull_request invoked (by resumed graph)
         # Record the HITL decision on the task row (without finishing the task)
+        if store._pool is None:
+            raise HTTPException(status_code=500, detail="store_not_connected")
         await store._pool.execute(
             "UPDATE tasks SET hitl_decision = $2 WHERE id = $1",
             task_id,

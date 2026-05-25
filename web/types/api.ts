@@ -23,7 +23,7 @@ export interface TaskListItem {
   issue_number: number | null;
   topology: Topology;
   status: TaskStatus;
-  total_cost_usd: number | null;
+  total_cost_usd: number | string | null;
   started_at: string;
   ended_at: string | null;
 }
@@ -35,14 +35,16 @@ export interface TaskDetail {
   issue_text: string;
   topology: Topology;
   status: TaskStatus;
-  total_cost_usd: number | null;
-  total_tokens_in: number | null;
-  total_tokens_out: number | null;
-  total_tokens_cached: number | null;
+  total_cost_usd: number | string | null;
+  total_tokens_in: number | string | null;
+  total_tokens_out: number | string | null;
+  total_tokens_cached: number | string | null;
   hitl_decision: HITLDecision | null;
   pr_url: string | null;
   started_at: string;
   ended_at: string | null;
+  /** Historical trace events for backfill on page load / reconnect */
+  trace_history?: TraceEvent[] | null;
 }
 
 export interface ListTasksResponse {

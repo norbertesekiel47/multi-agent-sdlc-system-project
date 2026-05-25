@@ -8,14 +8,18 @@ interface CostPanelProps {
   task: TaskDetail | undefined;
 }
 
-function formatCost(cost: number | null | undefined): string {
+function formatCost(cost: number | string | null | undefined): string {
   if (cost === null || cost === undefined) return "—";
-  return `$${cost.toFixed(4)}`;
+  const numCost = typeof cost === "string" ? parseFloat(cost) : cost;
+  if (isNaN(numCost)) return "—";
+  return `$${numCost.toFixed(4)}`;
 }
 
-function formatTokens(n: number | null | undefined): string {
+function formatTokens(n: number | string | null | undefined): string {
   if (n === null || n === undefined) return "—";
-  return n.toLocaleString();
+  const numN = typeof n === "string" ? parseInt(n, 10) : n;
+  if (isNaN(numN)) return "—";
+  return numN.toLocaleString();
 }
 
 export function CostPanel({ task }: CostPanelProps) {
