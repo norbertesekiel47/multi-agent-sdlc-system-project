@@ -92,6 +92,8 @@ class OrchestratorState(BaseModel):
     total_tokens_in: int = 0
     total_tokens_out: int = 0
     total_tokens_cached: int = 0
+    # Per-agent cost breakdown: agent_name → {tokens_in, tokens_out, cached_tokens, cost_usd}
+    agent_costs: dict[str, dict[str, int | str]] = {}
 
     # Error tracking
     errors: list[str] = []
@@ -412,6 +414,20 @@ async def run_single_agent_e2e(
         outcome = "success"  # Agent ran but not ready for PR
         status = "completed"
 
+    # Accumulate per-agent cost for single_agent
+    single_agent_costs = state.agent_costs.copy() if state.agent_costs else {}
+    existing = single_agent_costs.get("single_agent", {})
+    new_sa_tokens_in = int(existing.get("tokens_in", 0)) + tokens_in
+    new_sa_tokens_out = int(existing.get("tokens_out", 0)) + tokens_out
+    prev_sa_cost = Decimal(str(existing.get("cost_usd", "0")))
+    new_sa_cost = prev_sa_cost + cost_usd
+    single_agent_costs["single_agent"] = {
+        "tokens_in": new_sa_tokens_in,
+        "tokens_out": new_sa_tokens_out,
+        "cached_tokens": int(existing.get("cached_tokens", 0)),
+        "cost_usd": str(new_sa_cost),
+    }
+
     return {
         "agent_output": agent_output,
         "total_cost_usd": state.total_cost_usd + cost_usd,
@@ -421,6 +437,7 @@ async def run_single_agent_e2e(
         "pr_url": pr_url,
         "outcome": outcome,
         "status": status,
+        "agent_costs": single_agent_costs,
     }
 
 
@@ -649,6 +666,7 @@ class Orchestrator:
                         total_tokens_in=partial_state.total_tokens_in,
                         total_tokens_out=partial_state.total_tokens_out,
                         total_tokens_cached=partial_state.total_tokens_cached,
+                        agent_costs=partial_state.agent_costs if partial_state.agent_costs else None,
                     )
                 except Exception:
                     logger.warning("Could not extract partial state from interrupt result")
@@ -691,6 +709,7 @@ class Orchestrator:
             total_tokens_in=final_state.total_tokens_in,
             total_tokens_out=final_state.total_tokens_out,
             total_tokens_cached=final_state.total_tokens_cached,
+            agent_costs=final_state.agent_costs if final_state.agent_costs else None,
         )
 
         # Write outcome

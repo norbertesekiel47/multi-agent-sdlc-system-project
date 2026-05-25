@@ -84,6 +84,7 @@ class TaskDetailResponse(BaseModel):
     total_tokens_in: int | None = None
     total_tokens_out: int | None = None
     total_tokens_cached: int | None = None
+    agent_costs: dict[str, dict[str, object]] | None = None
     hitl_decision: str | None = None
     pr_url: str | None = None
     started_at: datetime

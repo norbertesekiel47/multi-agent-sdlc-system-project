@@ -166,8 +166,12 @@ class EpisodicStore:
         total_tokens_in: int | None = None,
         total_tokens_out: int | None = None,
         total_tokens_cached: int | None = None,
+        agent_costs: dict[str, dict[str, Any]] | None = None,
     ) -> None:
-        """Update running totals on a task row."""
+        """Update running totals on a task row.
+
+        agent_costs maps agent name → {tokens_in, tokens_out, cached_tokens, cost_usd}.
+        """
         async with self.pool.acquire() as conn:
             if total_cost_usd is not None:
                 await conn.execute(
@@ -192,6 +196,14 @@ class EpisodicStore:
                     "UPDATE tasks SET total_tokens_cached = $2 WHERE id = $1",
                     task_id,
                     total_tokens_cached,
+                )
+            if agent_costs is not None:
+                import json
+
+                await conn.execute(
+                    "UPDATE tasks SET agent_costs = $2 WHERE id = $1",
+                    task_id,
+                    json.dumps(agent_costs),
                 )
 
     async def finish_task(
@@ -507,6 +519,7 @@ class EpisodicStore:
             total_tokens_in=record["total_tokens_in"],
             total_tokens_out=record["total_tokens_out"],
             total_tokens_cached=record["total_tokens_cached"],
+            agent_costs=record.get("agent_costs"),
             hitl_decision=record["hitl_decision"],
             pr_url=record["pr_url"],
             started_at=record["started_at"],

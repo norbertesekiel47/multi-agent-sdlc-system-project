@@ -82,7 +82,7 @@ class TestSchemaMatchesSpec:
         expected = {
             "id", "repo_url", "issue_number", "issue_text", "topology",
             "status", "total_cost_usd", "total_tokens_in", "total_tokens_out",
-            "total_tokens_cached", "hitl_decision", "pr_url",
+            "total_tokens_cached", "agent_costs", "hitl_decision", "pr_url",
             "started_at", "ended_at",
         }
         assert expected == col_names, f"Missing columns: {expected - col_names}"

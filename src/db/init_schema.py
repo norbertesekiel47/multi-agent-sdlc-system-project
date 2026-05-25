@@ -44,6 +44,18 @@ async def _init_schema() -> None:
         logger.info("Episodic schema initialized successfully.")
         await conn.execute(SEMANTIC_SCHEMA_SQL)
         logger.info("Semantic schema initialized successfully.")
+
+        # ── Migrations (add columns introduced after initial schema) ──
+        # Add agent_costs column to tasks if it doesn't exist
+        agent_costs_exists = await conn.fetchval(
+            "SELECT COUNT(*) > 0 FROM information_schema.columns "
+            "WHERE table_name = 'tasks' AND column_name = 'agent_costs'"
+        )
+        if not agent_costs_exists:
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN agent_costs JSONB"
+            )
+            logger.info("Migration: added agent_costs column to tasks table.")
     finally:
         await conn.close()
 

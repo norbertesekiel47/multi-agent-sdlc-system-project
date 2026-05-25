@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   total_tokens_in   INTEGER,
   total_tokens_out  INTEGER,
   total_tokens_cached INTEGER,
+  agent_costs      JSONB,
   hitl_decision   TEXT,
   pr_url          TEXT,
   started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),

@@ -379,6 +379,7 @@ async def get_task(
         total_tokens_in=row.total_tokens_in,
         total_tokens_out=row.total_tokens_out,
         total_tokens_cached=row.total_tokens_cached,
+        agent_costs=row.agent_costs,
         hitl_decision=row.hitl_decision,
         pr_url=row.pr_url,
         started_at=row.started_at,

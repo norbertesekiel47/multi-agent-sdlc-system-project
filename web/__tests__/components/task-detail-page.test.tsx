@@ -73,6 +73,7 @@ const mockTask: TaskDetail = {
   total_tokens_in: 1000,
   total_tokens_out: 500,
   total_tokens_cached: 200,
+  agent_costs: null,
   hitl_decision: null,
   pr_url: null,
   started_at: "2026-05-24T10:00:00Z",

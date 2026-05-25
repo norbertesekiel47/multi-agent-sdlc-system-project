@@ -1110,6 +1110,38 @@ def _record_pydantic_success(
     return _sync_uncertainty_to_state(ue)
 
 
+def _accumulate_agent_cost(
+    *,
+    agent_name: str,
+    tokens_in: int,
+    tokens_out: int,
+    cached_tokens: int,
+    cost_usd: Decimal,
+    state: OrchestratorState,
+) -> dict[str, dict[str, dict[str, int | str]]]:
+    """Return an ``agent_costs`` state update that accumulates per-agent tokens and cost.
+
+    The ``agent_costs`` dict maps agent_name → {
+        "tokens_in": int, "tokens_out": int, "cached_tokens": int,
+        "cost_usd": str  (Decimal serialized as string for JSONB)
+    }.
+    """
+    current = state.agent_costs.copy() if state.agent_costs else {}
+    existing = current.get(agent_name, {})
+    new_tokens_in = int(existing.get("tokens_in", 0)) + tokens_in
+    new_tokens_out = int(existing.get("tokens_out", 0)) + tokens_out
+    new_cached_tokens = int(existing.get("cached_tokens", 0)) + cached_tokens
+    prev_cost = Decimal(str(existing.get("cost_usd", "0")))
+    new_cost = prev_cost + cost_usd
+    current[agent_name] = {
+        "tokens_in": new_tokens_in,
+        "tokens_out": new_tokens_out,
+        "cached_tokens": new_cached_tokens,
+        "cost_usd": str(new_cost),
+    }
+    return {"agent_costs": current}
+
+
 # ── Record diff rejection and check escalation ────────────────────
 
 
@@ -1537,6 +1569,16 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
         state=state,
     )
 
+    # Accumulate per-agent cost
+    agent_cost_update = _accumulate_agent_cost(
+        agent_name="planner",
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cached_tokens=0,
+        cost_usd=cost_usd,
+        state=state,
+    )
+
     return {
         "change_plan": plan,
         "issue_context": issue_context,
@@ -1545,6 +1587,7 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
         "total_tokens_out": state.total_tokens_out + tokens_out,
         "step_index": state.step_index,
         **success_update,
+        **agent_cost_update,
     }
 
 
@@ -1764,6 +1807,16 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
     ):
         return {**tool_recordings_update, **success_update}
 
+    # Accumulate per-agent cost
+    coder_agent_cost_update = _accumulate_agent_cost(
+        agent_name="coder",
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
+        cost_usd=cost_usd,
+        state=state,
+    )
+
     return {
         "code_edit": edit,
         "retry_counters": new_retry_counters,
@@ -1773,6 +1826,7 @@ async def run_coder(state: OrchestratorState) -> dict[str, Any]:
         "total_tokens_cached": state.total_tokens_cached + cached_tokens,
         **success_update,
         **(tool_recordings_update or {}),
+        **coder_agent_cost_update,
     }
 
 
@@ -2005,6 +2059,16 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
     ):
         return {**tool_recordings_update, **success_update, **diff_rejection_update}
 
+    # Accumulate per-agent cost
+    reviewer_agent_cost_update = _accumulate_agent_cost(
+        agent_name="reviewer",
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
+        cost_usd=cost_usd,
+        state=state,
+    )
+
     return {
         "review_result": review,
         "total_cost_usd": new_total_cost,
@@ -2014,6 +2078,7 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
         **success_update,
         **diff_rejection_update,
         **(tool_recordings_update or {}),
+        **reviewer_agent_cost_update,
     }
 
 
@@ -2283,6 +2348,16 @@ async def run_qa(state: OrchestratorState) -> dict[str, Any]:
     ):
         return {**tool_recordings_update, **success_update}
 
+    # Accumulate per-agent cost
+    qa_agent_cost_update = _accumulate_agent_cost(
+        agent_name="qa",
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
+        cost_usd=cost_usd,
+        state=state,
+    )
+
     return {
         "test_report": report,
         "total_cost_usd": new_total_cost,
@@ -2291,6 +2366,7 @@ async def run_qa(state: OrchestratorState) -> dict[str, Any]:
         "total_tokens_cached": state.total_tokens_cached + cached_tokens,
         **success_update,
         **(tool_recordings_update or {}),
+        **qa_agent_cost_update,
     }
 
 

@@ -28,6 +28,13 @@ export interface TaskListItem {
   ended_at: string | null;
 }
 
+export interface AgentCostRow {
+  tokens_in: number;
+  tokens_out: number;
+  cached_tokens: number;
+  cost_usd: string;  // Decimal serialized as string for JSONB
+}
+
 export interface TaskDetail {
   id: string;
   repo_url: string;
@@ -39,6 +46,8 @@ export interface TaskDetail {
   total_tokens_in: number | string | null;
   total_tokens_out: number | string | null;
   total_tokens_cached: number | string | null;
+  /** Per-agent cost breakdown from DB (available for terminal tasks) */
+  agent_costs: Record<string, AgentCostRow> | null;
   hitl_decision: HITLDecision | null;
   pr_url: string | null;
   started_at: string;

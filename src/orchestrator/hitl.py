@@ -223,6 +223,7 @@ async def _post_graph_completion(task_id: str, final_state: dict[str, Any]) -> N
             total_tokens_in = final_state.get("total_tokens_in")
             total_tokens_out = final_state.get("total_tokens_out")
             total_tokens_cached = final_state.get("total_tokens_cached")
+            agent_costs = final_state.get("agent_costs")
 
             if total_cost is not None:
                 from decimal import Decimal
@@ -234,6 +235,7 @@ async def _post_graph_completion(task_id: str, final_state: dict[str, Any]) -> N
                     total_tokens_in=total_tokens_in,
                     total_tokens_out=total_tokens_out,
                     total_tokens_cached=total_tokens_cached,
+                    agent_costs=agent_costs,
                 )
 
             # Write outcome if present

@@ -23,6 +23,7 @@ const mockTask: TaskDetail = {
   total_tokens_in: 1000,
   total_tokens_out: 500,
   total_tokens_cached: 200,
+  agent_costs: null,
   hitl_decision: null,
   pr_url: null,
   started_at: "2026-05-24T10:00:00Z",
@@ -43,15 +44,18 @@ describe("CostPanel", () => {
   });
 
   it("displays cost values formatted correctly", () => {
-    renderWithProviders(<CostPanel task={mockTask} />);
+    renderWithProviders(
+      <CostPanel task={mockTask} events={[]} isTerminal={false} />
+    );
 
-    expect(screen.getByText("$0.1234")).toBeInTheDocument();
-    expect(screen.getByText("1,000")).toBeInTheDocument();
-    expect(screen.getByText("500")).toBeInTheDocument();
-    expect(screen.getByText("200")).toBeInTheDocument();
+    // $0.1234 should appear somewhere in the component
+    expect(screen.getByTestId("total-cost")).toHaveTextContent("$0.1234");
+    expect(screen.getByTestId("total-tokens-in")).toHaveTextContent("1,000");
+    expect(screen.getByTestId("total-tokens-out")).toHaveTextContent("500");
+    expect(screen.getByTestId("total-cached-tokens")).toHaveTextContent("200");
   });
 
-  it("shows dash for null cost values", () => {
+  it("shows dash for null cost values when no events provide data", () => {
     const nullCostTask = {
       ...mockTask,
       total_cost_usd: null,
@@ -60,10 +64,14 @@ describe("CostPanel", () => {
       total_tokens_cached: null,
     };
 
-    renderWithProviders(<CostPanel task={nullCostTask} />);
+    renderWithProviders(
+      <CostPanel task={nullCostTask} events={[]} isTerminal={false} />
+    );
 
-    // Should show dashes for null values
-    const dashes = screen.getAllByText("—");
-    expect(dashes.length).toBeGreaterThanOrEqual(4);
+    // Should show dashes for null values where no events provide data
+    expect(screen.getByTestId("total-cost")).toHaveTextContent("—");
+    expect(screen.getByTestId("total-tokens-in")).toHaveTextContent("—");
+    expect(screen.getByTestId("total-tokens-out")).toHaveTextContent("—");
+    expect(screen.getByTestId("total-cached-tokens")).toHaveTextContent("—");
   });
 });

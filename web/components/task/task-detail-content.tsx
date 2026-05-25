@@ -19,6 +19,8 @@ const statusColors: Record<string, string> = {
   failed: "bg-red-500/15 text-red-500",
 };
 
+const TERMINAL_STATES = new Set(["completed", "failed", "rejected"]);
+
 /** Inner component that uses the trace stream hook (needs taskId from loaded task) */
 export function TaskDetailContent({
   id,
@@ -28,6 +30,7 @@ export function TaskDetailContent({
   task: NonNullable<ReturnType<typeof useTask>["data"]>;
 }) {
   const { events } = useTraceStream(id);
+  const isTerminal = TERMINAL_STATES.has(task.status);
 
   return (
     <div className="space-y-6">
@@ -81,7 +84,12 @@ export function TaskDetailContent({
           <TracePanel taskId={id} />
         </div>
         <div className="space-y-6">
-          <CostPanel task={task} />
+          <CostPanel
+            task={task}
+            events={events}
+            isTerminal={isTerminal}
+            maxBudgetUsd={2.0}
+          />
         </div>
       </div>
 

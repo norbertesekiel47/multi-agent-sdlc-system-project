@@ -66,6 +66,9 @@ from src.guardrails.errors import GuardrailViolation
 from src.llm.cost import get_max_cost_per_task
 from src.orchestrator import OrchestratorState
 from src.orchestrator.supervisor_only import (
+    _accumulate_agent_cost as _accumulate_agent_cost,
+)
+from src.orchestrator.supervisor_only import (
     _MAX_RETRIES_PER_STEP,
     _emit_trace_event,
     _trunc_json,
@@ -425,6 +428,15 @@ async def run_reviewer_hybrid(state: OrchestratorState) -> dict[str, Any]:
             "status": "failed",
         }
 
+    reviewer_agent_cost_update = _accumulate_agent_cost(
+        agent_name="reviewer",
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cached_tokens=cached_tokens,
+        cost_usd=cost_usd,
+        state=state,
+    )
+
     result: dict[str, Any] = {
         "review_result": review,
         "total_cost_usd": new_total_cost,
@@ -433,6 +445,7 @@ async def run_reviewer_hybrid(state: OrchestratorState) -> dict[str, Any]:
         "total_tokens_cached": state.total_tokens_cached + cached_tokens,
         # Save the Reviewer span ID for peer-handoff Coder parent
         "last_reviewer_span_id": reviewer_span_id or "",
+        **reviewer_agent_cost_update,
     }
 
     # If this is a peer-loop Reviewer that results in reject_with_changes,
@@ -648,6 +661,14 @@ async def run_peer_coder(state: OrchestratorState) -> dict[str, Any]:
         "total_tokens_cached": state.total_tokens_cached + cached_tokens,
         # Increment peer handoff count
         "peer_handoff_count": state.peer_handoff_count + 1,
+        **_accumulate_agent_cost(
+            agent_name="coder",
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cached_tokens=cached_tokens,
+            cost_usd=cost_usd,
+            state=state,
+        ),
     }
 
 
@@ -1015,4 +1036,12 @@ async def _run_coder_supervisor(state: OrchestratorState) -> dict[str, Any]:
         "total_tokens_in": state.total_tokens_in + tokens_in,
         "total_tokens_out": state.total_tokens_out + tokens_out,
         "total_tokens_cached": state.total_tokens_cached + cached_tokens,
+        **_accumulate_agent_cost(
+            agent_name="coder",
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cached_tokens=cached_tokens,
+            cost_usd=cost_usd,
+            state=state,
+        ),
     }
