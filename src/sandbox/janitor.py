@@ -12,6 +12,7 @@ import logging
 import time
 
 import docker
+from docker.models.containers import Container
 
 from src.sandbox.config import (
     JANITOR_MAX_AGE_SECONDS,
@@ -93,7 +94,7 @@ def _sync_sweep(max_age_seconds: int = JANITOR_MAX_AGE_SECONDS) -> int:
 
 
 def _container_created_timestamp(
-    container: docker.models.containers.Container,
+    container: Container,
 ) -> float | None:
     """Extract the Unix timestamp from a container's Created field."""
     try:

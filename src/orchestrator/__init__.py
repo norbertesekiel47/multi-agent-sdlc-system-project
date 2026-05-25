@@ -666,7 +666,9 @@ class Orchestrator:
                         total_tokens_in=partial_state.total_tokens_in,
                         total_tokens_out=partial_state.total_tokens_out,
                         total_tokens_cached=partial_state.total_tokens_cached,
-                        agent_costs=partial_state.agent_costs if partial_state.agent_costs else None,
+                        agent_costs=(
+                            partial_state.agent_costs if partial_state.agent_costs else None
+                        ),
                     )
                 except Exception:
                     logger.warning("Could not extract partial state from interrupt result")

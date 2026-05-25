@@ -353,7 +353,8 @@ async def get_task(
                 issues = d.decision_data.get("issues", [])
                 parts = [f"Verdict: {verdict}"]
                 if issues:
-                    parts.append(f"Issues ({len(issues)}): " + "; ".join(str(i) for i in issues[:5]))
+                    issue_str = "; ".join(str(i) for i in issues[:5])
+                    parts.append(f"Issues ({len(issues)}): {issue_str}")
                 review_summary = "\n".join(parts)
                 break
 

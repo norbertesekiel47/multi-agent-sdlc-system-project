@@ -30,6 +30,7 @@ node_modules/
 out/
 .pnpm-store/
 .npm/
+tsconfig.tsbuildinfo
 
 # ── OS / Editor ──
 .DS_Store

@@ -43,6 +43,7 @@ def _make_mock_store() -> AsyncMock:
     ))
     store.get_task = AsyncMock(return_value=None)  # no task found by default
     store.list_tasks = AsyncMock(return_value=[])
+    store.get_latest_outcomes = AsyncMock(return_value={})
     store.update_task_totals = AsyncMock()
     store.close = AsyncMock()
     return store
@@ -1198,7 +1199,7 @@ class TestAPIEndpointsIntegration:
             )
 
             # Filter by topology
-            results = await store.list_tasks(topology="hybrid")
+            results = await store.list_tasks(topology="hybrid", limit=1000)
             assert any(r.id == t1.id for r in results)
             assert not any(r.id == t2.id for r in results)
 

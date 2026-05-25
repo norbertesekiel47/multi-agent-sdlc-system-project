@@ -66,9 +66,6 @@ from src.guardrails.errors import GuardrailViolation
 from src.llm.cost import get_max_cost_per_task
 from src.orchestrator import OrchestratorState
 from src.orchestrator.supervisor_only import (
-    _accumulate_agent_cost as _accumulate_agent_cost,
-)
-from src.orchestrator.supervisor_only import (
     _MAX_RETRIES_PER_STEP,
     _emit_trace_event,
     _trunc_json,
@@ -85,6 +82,9 @@ from src.orchestrator.supervisor_only import (
     run_qa,
     run_supervisor,
     run_supervisor_finalize,
+)
+from src.orchestrator.supervisor_only import (
+    _accumulate_agent_cost as _accumulate_agent_cost,
 )
 from src.orchestrator.supervisor_only import (
     _handle_guardrail_violation as _handle_guardrail_violation,
