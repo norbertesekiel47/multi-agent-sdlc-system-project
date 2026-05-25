@@ -32,6 +32,7 @@ export const taskKeys = {
 /** Hook for listing tasks with optional filters and polling */
 export function useTasks(params?: {
   repo_url?: string;
+  repo?: string;
   status?: string;
   outcome?: string;
   topology?: string;

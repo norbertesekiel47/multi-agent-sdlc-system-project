@@ -263,11 +263,16 @@ async def list_tasks(
     status: str | None = Query(default=None),
     outcome: str | None = Query(default=None),
     topology: str | None = Query(default=None),
+    repo: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     store: EpisodicStore = Depends(get_store),  # noqa: B008
 ) -> ListTasksResponse:
-    """List tasks with optional filters."""
+    """List tasks with optional filters.
+
+    The ``repo`` parameter performs case-insensitive substring matching
+    on repo_url, unlike ``repo_url`` which does exact match.
+    """
     rows = await store.list_tasks(
         repo_url=repo_url,
         status=status,
@@ -276,6 +281,16 @@ async def list_tasks(
         limit=limit,
         offset=offset,
     )
+
+    # Client-side repo substring filter (case-insensitive)
+    if repo is not None and repo.strip():
+        repo_lower = repo.strip().lower()
+        rows = [r for r in rows if repo_lower in r.repo_url.lower()]
+
+    # Fetch latest outcomes for all returned tasks
+    task_ids = [r.id for r in rows]
+    outcome_map = await store.get_latest_outcomes(task_ids)
+
     items = [
         TaskListItemResponse(
             id=r.id,
@@ -283,6 +298,8 @@ async def list_tasks(
             issue_number=r.issue_number,
             topology=r.topology,
             status=r.status,
+            outcome=outcome_map.get(r.id),
+            pr_url=r.pr_url,
             total_cost_usd=r.total_cost_usd,
             started_at=r.started_at,
             ended_at=r.ended_at,

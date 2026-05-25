@@ -55,6 +55,7 @@ class ListTasksQuery(BaseModel):
     """Query parameters for GET /tasks."""
 
     repo_url: str | None = None
+    repo: str | None = None
     status: str | None = None
     outcome: str | None = None
     topology: str | None = None
@@ -106,6 +107,8 @@ class TaskListItemResponse(BaseModel):
     issue_number: int | None = None
     topology: str
     status: str
+    outcome: str | None = None
+    pr_url: str | None = None
     total_cost_usd: Decimal | None = None
     started_at: datetime
     ended_at: datetime | None = None

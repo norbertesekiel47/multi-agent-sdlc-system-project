@@ -255,14 +255,30 @@ class EpisodicStore:
             idx += 1
 
         if status is not None:
-            conditions.append(f"status = ${idx}")
-            args.append(status)
-            idx += 1
+            # Support comma-separated status values (e.g. "completed,failed,rejected")
+            status_values = [s.strip() for s in status.split(",") if s.strip()]
+            if len(status_values) == 1:
+                conditions.append(f"status = ${idx}")
+                args.append(status_values[0])
+                idx += 1
+            elif status_values:
+                placeholders = ", ".join(f"${idx + i}" for i in range(len(status_values)))
+                conditions.append(f"status IN ({placeholders})")
+                args.extend(status_values)
+                idx += len(status_values)
 
         if topology is not None:
-            conditions.append(f"topology = ${idx}")
-            args.append(topology)
-            idx += 1
+            # Support comma-separated topology values
+            topology_values = [t.strip() for t in topology.split(",") if t.strip()]
+            if len(topology_values) == 1:
+                conditions.append(f"topology = ${idx}")
+                args.append(topology_values[0])
+                idx += 1
+            elif topology_values:
+                placeholders = ", ".join(f"${idx + i}" for i in range(len(topology_values)))
+                conditions.append(f"topology IN ({placeholders})")
+                args.extend(topology_values)
+                idx += len(topology_values)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
@@ -274,7 +290,7 @@ class EpisodicStore:
                 JOIN outcomes o ON o.task_id = t.id
                 {where}
                 {"AND" if conditions else "WHERE"} o.outcome = ${idx}
-                ORDER BY t.started_at DESC
+                ORDER BY t.ended_at DESC NULLS LAST, t.started_at DESC
                 LIMIT ${idx + 1} OFFSET ${idx + 2}
             """
             args.extend([outcome, limit, offset])
@@ -282,7 +298,7 @@ class EpisodicStore:
             query = f"""
                 SELECT * FROM tasks
                 {where}
-                ORDER BY started_at DESC
+                ORDER BY ended_at DESC NULLS LAST, started_at DESC
                 LIMIT ${idx} OFFSET ${idx + 1}
             """
             args.extend([limit, offset])
@@ -291,6 +307,29 @@ class EpisodicStore:
             rows = await conn.fetch(query, *args)
 
         return [self._task_row_from_record(r) for r in rows]
+
+    async def get_latest_outcomes(
+        self, task_ids: list[UUID]
+    ) -> dict[UUID, str]:
+        """Return the latest outcome string for each task_id.
+
+        Returns a dict mapping task_id → outcome.  Tasks without
+        an outcomes row are absent from the dict.
+        """
+        if not task_ids:
+            return {}
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (o.task_id)
+                    o.task_id, o.outcome
+                FROM outcomes o
+                WHERE o.task_id = ANY($1)
+                ORDER BY o.task_id, o.recorded_at DESC
+                """,
+                task_ids,
+            )
+        return {r["task_id"]: r["outcome"] for r in rows}
 
     # ── Decisions ─────────────────────────────────────────────────
 

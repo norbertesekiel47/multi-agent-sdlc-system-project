@@ -73,6 +73,7 @@ export const apiClient = {
   /** List tasks with optional filters. GET /tasks */
   listTasks: (params?: {
     repo_url?: string;
+    repo?: string;
     status?: string;
     outcome?: string;
     topology?: string;

@@ -23,6 +23,8 @@ export interface TaskListItem {
   issue_number: number | null;
   topology: Topology;
   status: TaskStatus;
+  outcome: string | null;
+  pr_url: string | null;
   total_cost_usd: number | string | null;
   started_at: string;
   ended_at: string | null;
