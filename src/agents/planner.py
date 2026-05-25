@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID, uuid4
 
@@ -24,6 +26,7 @@ from pydantic_ai import Agent, RunContext
 
 from src.agents.models import ChangePlan, IssueContext
 from src.llm.client import get_temperature
+from src.llm.cost import estimate_cost_tiktoken
 from src.memory.episodic.models import CreateDecisionParams
 
 if TYPE_CHECKING:
@@ -123,6 +126,17 @@ class PlannerDeps(BaseModel):
         default=None,
         description="Full IssueContext with RAG hits and episodic facts",
     )
+
+
+@dataclass(frozen=True)
+class PlannerRunResult:
+    """Planner output plus usage metadata for orchestrator accounting."""
+
+    plan: ChangePlan
+    tokens_in: int
+    tokens_out: int
+    cached_tokens: int
+    cost_usd: Decimal
 
 
 # ── System Prompt ───────────────────────────────────────────────────
@@ -285,6 +299,28 @@ async def persist_change_plan(
 # ── Convenience: Run Planner with Full Context ────────────────────
 
 
+def _extract_usage_tokens(result: Any) -> tuple[int, int]:
+    """Extract request/response token counts from a PydanticAI result."""
+    usage_attr = getattr(result, "usage", None)
+    usage = usage_attr() if callable(usage_attr) else usage_attr
+    if usage is None:
+        return 0, 0
+
+    tokens_in = (
+        getattr(usage, "request_tokens", 0)
+        or getattr(usage, "input_tokens", 0)
+        or getattr(usage, "prompt_tokens", 0)
+        or 0
+    )
+    tokens_out = (
+        getattr(usage, "response_tokens", 0)
+        or getattr(usage, "output_tokens", 0)
+        or getattr(usage, "completion_tokens", 0)
+        or 0
+    )
+    return int(tokens_in), int(tokens_out)
+
+
 async def run_planner(
     *,
     issue_context: IssueContext,
@@ -292,7 +328,8 @@ async def run_planner(
     rag_retriever: Any | None = None,
     task_id: UUID | None = None,
     trace_id: str = "",
-) -> ChangePlan:
+    return_metadata: bool = False,
+) -> ChangePlan | PlannerRunResult:
     """Run the Planner agent with full IssueContext.
 
     This is the primary entry point for the orchestrator. It:
@@ -308,8 +345,10 @@ async def run_planner(
         task_id: The current task's UUID (for decision persistence).
         trace_id: Langfuse trace ID for span hierarchy.
 
+        return_metadata: Return PlannerRunResult with usage/cost metadata.
+
     Returns:
-        A Pydantic-valid ChangePlan.
+        A Pydantic-valid ChangePlan, or PlannerRunResult when requested.
     """
     if task_id is None:
         task_id = uuid4()
@@ -332,6 +371,12 @@ async def run_planner(
         model_settings={"temperature": get_temperature()},
     )
     plan: ChangePlan = result.output
+    tokens_in, tokens_out = _extract_usage_tokens(result)
+    cost_usd = estimate_cost_tiktoken(
+        model=_PLANNER_MODEL,
+        prompt_tokens=tokens_in,
+        completion_tokens=tokens_out,
+    )
 
     # Persist the ChangePlan if a store is available
     if episodic_store is not None:
@@ -340,6 +385,15 @@ async def run_planner(
             task_id=task_id,
             plan=plan,
             step_index=0,
+        )
+
+    if return_metadata:
+        return PlannerRunResult(
+            plan=plan,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cached_tokens=0,
+            cost_usd=cost_usd,
         )
 
     return plan

@@ -95,6 +95,39 @@ class TestPlannerEmitsTypedChangePlan:
         assert len(plan.rationale) >= 20
 
     @pytest.mark.asyncio
+    async def test_run_planner_can_return_usage_metadata(self) -> None:
+        """Planner orchestration needs actual token/cost metadata, not zeros."""
+        from decimal import Decimal
+        from types import SimpleNamespace
+
+        from src.agents.planner import PlannerRunResult, planner, run_planner
+
+        ctx = _make_issue_context()
+
+        mock_result = MagicMock()
+        mock_result.output = _make_change_plan()
+        mock_result.usage = lambda: SimpleNamespace(
+            request_tokens=1234,
+            response_tokens=321,
+        )
+
+        with patch.object(planner, "run", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = mock_result
+            result = await run_planner(
+                issue_context=ctx,
+                task_id=uuid4(),
+                trace_id="test-trace",
+                return_metadata=True,
+            )
+
+        assert isinstance(result, PlannerRunResult)
+        assert isinstance(result.plan, ChangePlan)
+        assert result.tokens_in == 1234
+        assert result.tokens_out == 321
+        assert result.cost_usd > Decimal("0")
+        mock_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_change_plan_target_files_non_empty(self) -> None:
         """ChangePlan.target_files must be non-empty list."""
         from src.agents.planner import PlannerDeps, planner

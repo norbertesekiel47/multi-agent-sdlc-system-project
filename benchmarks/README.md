@@ -5,7 +5,7 @@
 - **Run ID:** `m6-full-matrix-001`
 - **Started:** 2026-05-24T08:00:00Z
 - **Ended:** 2026-05-24T20:00:00Z
-- **Slice size:** 30 instances
+- **Slice size:** 10 instances
 - **Runs per cell:** 3
 
 ## Results Summary

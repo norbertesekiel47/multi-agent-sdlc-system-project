@@ -1191,6 +1191,8 @@ def _record_diff_rejection_check(
 def route_after_planner(
     state: OrchestratorState,
 ) -> Literal[
+    "halt_cost_budget_exhausted",
+    "halt_task_failed",
     "hitl_guardrail_escalation",
     "hitl_loop_detected",
     "hitl_uncertainty_escalation",
@@ -1204,18 +1206,24 @@ def route_after_planner(
     VAL-LOOP-DETECT-004: If loop was detected, route to HITL.
     VAL-UNCERTAINTY-007: If uncertainty escalation, route to HITL.
     """
+    if state.outcome == "cost_budget_exhausted":
+        return "halt_cost_budget_exhausted"
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
     if state.outcome == "loop_detected":
         return "hitl_loop_detected"
     if state.outcome == "uncertainty_escalation":
         return "hitl_uncertainty_escalation"
+    if state.status == "failed":
+        return "halt_task_failed"
     return "run_coder"
 
 
 def route_after_coder(
     state: OrchestratorState,
 ) -> Literal[
+    "halt_cost_budget_exhausted",
+    "halt_task_failed",
     "hitl_guardrail_escalation",
     "hitl_loop_detected",
     "hitl_uncertainty_escalation",
@@ -1224,18 +1232,24 @@ def route_after_coder(
     """After Coder, route to guardrail escalation, loop detection,
     uncertainty escalation, or Reviewer.
     """
+    if state.outcome == "cost_budget_exhausted":
+        return "halt_cost_budget_exhausted"
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
     if state.outcome == "loop_detected":
         return "hitl_loop_detected"
     if state.outcome == "uncertainty_escalation":
         return "hitl_uncertainty_escalation"
+    if state.status == "failed":
+        return "halt_task_failed"
     return "run_reviewer"
 
 
 def route_after_review(
     state: OrchestratorState,
 ) -> Literal[
+    "halt_cost_budget_exhausted",
+    "halt_task_failed",
     "hitl_guardrail_escalation",
     "hitl_loop_detected",
     "hitl_uncertainty_escalation",
@@ -1261,6 +1275,8 @@ def route_after_review(
     VAL-REVIEWER-004: When ReviewResult.verdict == 'accept', the
     orchestrator routes to QA next, not back to Coder.
     """
+    if state.outcome == "cost_budget_exhausted":
+        return "halt_cost_budget_exhausted"
     # Check for guardrail violations first
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
@@ -1270,6 +1286,8 @@ def route_after_review(
     # Check for uncertainty escalation
     if state.outcome == "uncertainty_escalation":
         return "hitl_uncertainty_escalation"
+    if state.status == "failed":
+        return "halt_task_failed"
 
     review = state.review_result
     if review is None:
@@ -1469,23 +1487,32 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
     cached_tokens = 0
 
     try:
+        from src.agents.planner import PlannerRunResult
         from src.agents.planner import run_planner as _run_planner_agent
 
         semantic_store = get_semantic_store(task_id)
-        plan = await _run_planner_agent(
+        planner_result = await _run_planner_agent(
             issue_context=issue_context,
             episodic_store=store,
             rag_retriever=semantic_store,
             task_id=UUID(task_id) if task_id else None,
             trace_id=trace_id,
+            return_metadata=True,
         )
-
-        # Estimate cost from the Planner model
-        cost_usd = estimate_cost_tiktoken(
-            model="deepseek/deepseek-v4-pro",
-            prompt_tokens=tokens_in,
-            completion_tokens=tokens_out,
-        )
+        if isinstance(planner_result, PlannerRunResult):
+            plan = planner_result.plan
+            tokens_in = planner_result.tokens_in
+            tokens_out = planner_result.tokens_out
+            cached_tokens = planner_result.cached_tokens
+            cost_usd = planner_result.cost_usd
+        else:
+            plan = planner_result
+            # Backward-compatible fallback for tests or custom agent shims.
+            cost_usd = estimate_cost_tiktoken(
+                model="deepseek/deepseek-v4-pro",
+                prompt_tokens=tokens_in,
+                completion_tokens=tokens_out,
+            )
 
     except Exception as exc:
         logger.error("Planner agent failed for task %s: %s", task_id, exc)
@@ -2093,6 +2120,8 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
 def route_after_qa(
     state: OrchestratorState,
 ) -> Literal[
+    "halt_cost_budget_exhausted",
+    "halt_task_failed",
     "hitl_guardrail_escalation",
     "hitl_loop_detected",
     "hitl_uncertainty_escalation",
@@ -2111,6 +2140,8 @@ def route_after_qa(
     NOT proceed to PR creation. It either retries (within budget)
     or escalates to HITL with cause persistent_test_failure.
     """
+    if state.outcome == "cost_budget_exhausted":
+        return "halt_cost_budget_exhausted"
     # Check for guardrail violations first
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
@@ -2120,6 +2151,8 @@ def route_after_qa(
     # Check for uncertainty escalation
     if state.outcome == "uncertainty_escalation":
         return "hitl_uncertainty_escalation"
+    if state.status == "failed":
+        return "halt_task_failed"
 
     report = state.test_report
     if report is None:
@@ -2751,7 +2784,11 @@ async def run_commit_and_push(state: OrchestratorState) -> dict[str, Any]:
 
     if sandbox is None:
         logger.error("No sandbox for commit_and_push on task %s", task_id)
-        return {"errors": ["No sandbox available for commit"]}
+        return {
+            "errors": ["No sandbox available for commit"],
+            "outcome": "github_delivery_failed",
+            "status": "failed",
+        }
 
     try:
         pat = os.getenv("GITHUB_PAT", "")
@@ -2772,9 +2809,22 @@ async def run_commit_and_push(state: OrchestratorState) -> dict[str, Any]:
         logger.info("Committed and pushed for task %s on branch %s", task_id, branch_name)
     except Exception as exc:
         logger.error("Commit/push failed for task %s: %s", task_id, exc)
-        return {"errors": [f"Commit/push failed: {exc}"]}
+        return {
+            "errors": [f"Commit/push failed: {exc}"],
+            "outcome": "github_delivery_failed",
+            "status": "failed",
+        }
 
     return {"step": "committed"}
+
+
+def route_after_commit_and_push(
+    state: OrchestratorState,
+) -> Literal["run_open_pr", "halt_github_delivery_failed"]:
+    """Only continue to PR creation after a successful commit/push."""
+    if state.outcome == "github_delivery_failed" or state.status == "failed":
+        return "halt_github_delivery_failed"
+    return "run_open_pr"
 
 
 async def run_open_pr(state: OrchestratorState) -> dict[str, Any]:
@@ -2790,6 +2840,7 @@ async def run_open_pr(state: OrchestratorState) -> dict[str, Any]:
 
     sandbox = get_sandbox(task_id)
     pr_url = ""
+    error_message = ""
 
     if sandbox is not None and state.code_edit is not None:
         try:
@@ -2812,14 +2863,19 @@ async def run_open_pr(state: OrchestratorState) -> dict[str, Any]:
             logger.info("PR opened: %s", pr_url)
 
         except Exception as exc:
+            error_message = f"PR open failed: {exc}"
             logger.error("PR open failed for task %s: %s", task_id, exc)
+    else:
+        error_message = "PR open failed: missing sandbox or code edit"
+        logger.error("%s for task %s", error_message, task_id)
 
     # Update supervisor span end
     tracing = get_tracing_client()
+    outcome = "pr_opened" if pr_url else "github_delivery_failed"
     tracing.update_span(
         trace_id=trace_id,
         span_id=supervisor_span_id,
-        output_data={"outcome": "pr_opened" if pr_url else "success", "pr_url": pr_url},
+        output_data={"outcome": outcome, "pr_url": pr_url},
         end_time=datetime.now(UTC),
     )
     await _emit_trace_event(
@@ -2829,7 +2885,7 @@ async def run_open_pr(state: OrchestratorState) -> dict[str, Any]:
         parent_span_id=None,
         name="supervisor",
         event_type="node_end",
-        metadata={"agent_name": "supervisor", "outcome": "pr_opened" if pr_url else "success"},
+        metadata={"agent_name": "supervisor", "outcome": outcome},
     )
 
     if pr_url:
@@ -2840,8 +2896,35 @@ async def run_open_pr(state: OrchestratorState) -> dict[str, Any]:
         }
 
     return {
-        "outcome": "success",
-        "status": "completed",
+        "errors": [error_message],
+        "outcome": "github_delivery_failed",
+        "status": "failed",
+    }
+
+
+async def halt_cost_budget_exhausted(state: OrchestratorState) -> dict[str, Any]:
+    """Terminal node for exhausted per-task cost budget."""
+    return {
+        "outcome": "cost_budget_exhausted",
+        "status": "failed",
+    }
+
+
+async def halt_github_delivery_failed(state: OrchestratorState) -> dict[str, Any]:
+    """Terminal node for failed commit/push/PR delivery."""
+    return {
+        "outcome": "github_delivery_failed",
+        "status": "failed",
+        "errors": state.errors,
+    }
+
+
+async def halt_task_failed(state: OrchestratorState) -> dict[str, Any]:
+    """Terminal node for failed agent/sandbox stages."""
+    return {
+        "outcome": state.outcome or "failed",
+        "status": "failed",
+        "errors": state.errors,
     }
 
 
@@ -3094,6 +3177,9 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
     graph.add_node("run_reviewer", run_reviewer)
     graph.add_node("run_qa", run_qa)
     graph.add_node("run_supervisor_finalize", run_supervisor_finalize)
+    graph.add_node("halt_cost_budget_exhausted", halt_cost_budget_exhausted)
+    graph.add_node("halt_github_delivery_failed", halt_github_delivery_failed)
+    graph.add_node("halt_task_failed", halt_task_failed)
     graph.add_node("halt_retry_exhausted", halt_retry_exhausted)
     graph.add_node("halt_test_failure", halt_test_failure)
 
@@ -3126,6 +3212,8 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_planner",
         route_after_planner,
         {
+            "halt_cost_budget_exhausted": "halt_cost_budget_exhausted",
+            "halt_task_failed": "halt_task_failed",
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "hitl_loop_detected": "hitl_loop_detected",
             "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
@@ -3138,6 +3226,8 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_coder",
         route_after_coder,
         {
+            "halt_cost_budget_exhausted": "halt_cost_budget_exhausted",
+            "halt_task_failed": "halt_task_failed",
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "hitl_loop_detected": "hitl_loop_detected",
             "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
@@ -3150,6 +3240,8 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_reviewer",
         route_after_review,
         {
+            "halt_cost_budget_exhausted": "halt_cost_budget_exhausted",
+            "halt_task_failed": "halt_task_failed",
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "hitl_loop_detected": "hitl_loop_detected",
             "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
@@ -3165,6 +3257,8 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_qa",
         route_after_qa,
         {
+            "halt_cost_budget_exhausted": "halt_cost_budget_exhausted",
+            "halt_task_failed": "halt_task_failed",
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "hitl_loop_detected": "hitl_loop_detected",
             "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
@@ -3188,8 +3282,18 @@ def build_supervisor_only_graph() -> StateGraph:  # type: ignore[type-arg]
         graph.add_edge("run_supervisor_finalize", "hitl_pre_pr")
 
     graph.add_edge("hitl_pre_pr", "run_commit_and_push")
-    graph.add_edge("run_commit_and_push", "run_open_pr")
+    graph.add_conditional_edges(
+        "run_commit_and_push",
+        route_after_commit_and_push,
+        {
+            "run_open_pr": "run_open_pr",
+            "halt_github_delivery_failed": "halt_github_delivery_failed",
+        },
+    )
     graph.add_edge("run_open_pr", END)
+    graph.add_edge("halt_cost_budget_exhausted", END)
+    graph.add_edge("halt_github_delivery_failed", END)
+    graph.add_edge("halt_task_failed", END)
 
     # Halt retry exhausted → END (VAL-RETRY-002: now triggers HITL)
     graph.add_edge("halt_retry_exhausted", END)

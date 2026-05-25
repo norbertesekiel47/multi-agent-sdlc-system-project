@@ -4,32 +4,68 @@
 
 This demo shows a complete task lifecycle: from issue submission through the hybrid topology (Planner → Coder ⇄ Reviewer → QA → HITL approval → PR open), with failure-mode mitigations active and Langfuse tracing visible.
 
-**Estimated demo duration**: 4–6 minutes (real-time task execution ~2–3 minutes, narration ~2–3 minutes)
+**Estimated demo duration**: 5–8 minutes. Agent execution depends on model latency, repo clone speed, and Docker startup.
 
 ---
 
 ## Prerequisites
 
-Before recording, ensure the following are running:
+Run commands from the repository root. The project uses `.env`, not `.env.local`.
+
+Fast path:
 
 ```bash
-# 1. Start infrastructure
-docker compose --env-file .env -f infra/docker-compose.yml up -d postgres langfuse
+cp .env.example .env   # Fill in real credentials before continuing
+bash init.sh
+source .venv/bin/activate
+```
 
-# 2. Build sandbox images
+Manual path:
+
+```bash
+# 1. Install dependencies
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+pnpm install --frozen-lockfile
+
+# 2. Start infrastructure. This starts Postgres plus Langfuse and its dependencies.
+docker compose --env-file .env -f infra/docker-compose.yml up -d
+
+# 3. Build sandbox images
 docker build -t sdlc-swarm/sandbox-base:latest infra/sandbox/
 docker build -t sdlc-swarm/sandbox-proxy:latest infra/sandbox-proxy/
 
-# 3. Start FastAPI backend
+# 4. Initialize the app database
+python -m src.db.init_schema
+
+# 5. Start FastAPI backend
 python -m uvicorn src.api.main:app --host 0.0.0.0 --port 3100
 
-# 4. Start Next.js dashboard
-NEXT_PUBLIC_API_URL=http://localhost:3100 pnpm --filter web dev --port 3101
+# 6. Start Next.js dashboard in another terminal
+NEXT_PUBLIC_API_URL=http://localhost:3100 pnpm dev
 
-# 5. Verify everything is healthy
-curl -sf http://localhost:3100/health  # {"status":"ok","db":"ok","langfuse":"ok"}
-curl -sf http://localhost:3101          # Dashboard renders
+# 7. Verify services
+curl -fsS http://localhost:3100/health | python3 -m json.tool
+curl -fsS http://localhost:3101 >/dev/null
 ```
+
+`/health` can be `degraded` while Langfuse keys are blank or Langfuse is still starting. For this demo, `db` must be `ok`.
+
+Required `.env` values for a real PR-opening demo:
+
+- `OPENROUTER_API_KEY`
+- `OPENAI_API_KEY`
+- `GITHUB_PAT` with Contents read/write, Pull requests read/write, Issues read
+- `GITHUB_USERNAME`
+
+You can also use the helper:
+
+```bash
+bash docs/demo/record-demo.sh
+```
+
+Use `--skip-setup` if backend and dashboard are already running, or `--auto-approve` for a non-interactive dry run.
 
 ---
 
@@ -51,8 +87,9 @@ curl -sf http://localhost:3101          # Dashboard renders
 **Action**:
 1. Enter repo URL: `https://github.com/norbertesekiel47/sdlc-swarm-curated`
 2. Enter issue number: `1`
-3. Confirm topology is `hybrid`
-4. Click **Submit**
+3. Enter issue text: `Demo task: fix issue #1 from the curated SDLC-Swarm demo repository.`
+4. Confirm topology is `hybrid`
+5. Click **Submit**
 
 **Narration**:
 > "We submit an issue from our curated test repo. The system will clone the repository into an ephemeral Docker sandbox, index the codebase for RAG retrieval, and then run four specialized agents in sequence with peer handoff between Coder and Reviewer."
@@ -84,7 +121,7 @@ curl -sf http://localhost:3101          # Dashboard renders
    - Input: `CodeEdit` + diff
    - Output: `ReviewResult` with verdict
    - Tool call: `sandbox.run_command` (ruff/mypy)
-   - If verdict is `reject_with_changes`: Coder→Reviewer peer handoff visible (swarm edge)
+   - If verdict is `reject_with_changes`: Reviewer→Coder peer handoff visible in the trace hierarchy
 7. **QA agent** — trace entry with:
    - Model: `deepseek/deepseek-chat-v3-0324`
    - Input: `CodeEdit` (post-review)
@@ -100,7 +137,7 @@ curl -sf http://localhost:3101          # Dashboard renders
 
 **Camera**: Browser at `http://localhost:3101/tasks/{id}/hitl`
 
-**What happens**: When the orchestrator reaches the pre-PR interrupt, the dashboard navigates to the HITL page.
+**What happens**: When the orchestrator reaches the pre-PR interrupt, the task status becomes `awaiting_hitl`. Open `/tasks/{id}/hitl` if the dashboard does not navigate there automatically.
 
 **What you'll see**:
 1. **Diff viewer** — unified diff with syntax highlighting (green additions, red deletions)
@@ -117,7 +154,7 @@ curl -sf http://localhost:3101          # Dashboard renders
 - Buttons disable during request (loading state)
 - `POST /tasks/{id}/hitl/decision` returns 200
 - Dashboard transitions to the resumed state
-- Trace stream continues with `github_client.create_pull` span
+- Trace stream continues with the GitHub delivery step
 
 ### Part 5: PR Creation and Completion (3:30–4:00)
 
@@ -128,7 +165,7 @@ curl -sf http://localhost:3101          # Dashboard renders
 2. **Task status** — transitions from `awaiting_hitl` → `completed`
 3. **PR URL** — appears in the task detail, clickable link to GitHub
 4. **Cost panel** — frozen at final value
-5. **Sandbox teardown** — trace entry: `sandbox.teardown`
+5. **Sandbox cleanup** — the task-scoped sandbox is torn down after completion
 
 **Narration**:
 > "After approval, the GitHub client commits the changes, pushes to a branch, and opens a pull request. The task is complete. The sandbox is torn down — no containers or networks remain. Let's click through to the actual PR on GitHub."
@@ -152,6 +189,7 @@ curl -X POST http://localhost:3100/tasks \
   -d '{
     "repo_url": "https://github.com/norbertesekiel47/sdlc-swarm-curated",
     "issue_number": 5,
+    "issue_text": "Demo task intended to exercise loop detection.",
     "topology": "hybrid"
   }'
 ```
@@ -176,7 +214,7 @@ curl -X POST http://localhost:3100/tasks \
 **Camera**: Back to dashboard homepage
 
 **Narration**:
-> "SDLC-Swarm demonstrates that production-grade autonomous agents need deterministic failure-mode mitigations — not LLM self-confidence, but mechanical, cause-tagged triggers that surface actionable information to human operators. Our benchmarks across 360 runs show that the hybrid topology with peer handoff achieves the highest success rate at 36.7%, while prompt caching reduces cost by up to 28.8%. All failure mitigations, benchmark results, and the full architecture are documented in the repository."
+> "SDLC-Swarm demonstrates that production-grade autonomous agents need deterministic failure-mode mitigations — not LLM self-confidence, but mechanical, cause-tagged triggers that surface actionable information to human operators. Our published benchmark run shows that the hybrid topology with peer handoff achieves the highest success rate at 36.7%, while prompt caching reduces cost by up to 28.8%. All failure mitigations, benchmark results, and the full architecture are documented in the repository."
 
 ---
 

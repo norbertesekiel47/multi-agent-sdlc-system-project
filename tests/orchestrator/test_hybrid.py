@@ -644,6 +644,7 @@ class TestOrchestratorHybridDispatch:
             patch("src.orchestrator.hitl.unregister_graph"),
             patch("src.orchestrator.SandboxManager") as mock_sandbox_cls,
             patch("src.orchestrator.GitHubClient"),
+            patch("src.memory.semantic.store.SemanticStore") as mock_semantic_cls,
         ):
             mock_graph = MagicMock()
             mock_build.return_value = mock_graph
@@ -653,6 +654,10 @@ class TestOrchestratorHybridDispatch:
             mock_sandbox_inst.workspace_dir = "/tmp/test"
             mock_sandbox_inst.teardown = AsyncMock()
             mock_sandbox_cls.return_value = mock_sandbox_inst
+            mock_semantic_inst = AsyncMock()
+            mock_semantic_inst.connect = AsyncMock()
+            mock_semantic_inst.close = AsyncMock()
+            mock_semantic_cls.return_value = mock_semantic_inst
 
             mock_compiled = MagicMock()
             mock_compiled.ainvoke = AsyncMock(

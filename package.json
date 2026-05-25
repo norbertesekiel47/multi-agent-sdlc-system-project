@@ -1,0 +1,13 @@
+{
+  "name": "sdlc-swarm-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter web dev",
+    "build": "pnpm --filter web build",
+    "lint": "ruff check src tests && pnpm --filter web lint",
+    "typecheck": "mypy --strict src && pnpm --filter web typecheck",
+    "test": "pytest -q tests && pnpm --filter web test",
+    "test:e2e": "pytest -q tests"
+  }
+}

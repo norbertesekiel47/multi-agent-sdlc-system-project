@@ -1,6 +1,6 @@
 # Building Failure-Mode Mitigations for Autonomous LLM Agents: Lessons from SDLC-Swarm
 
-*May 2026 — A deep-dive into retry budgets, loop detection, uncertainty escalation, and what benchmarking 360 runs across three topologies taught us about making multi-agent systems production-ready.*
+*May 2026 — A deep-dive into retry budgets, loop detection, uncertainty escalation, and what the published topology benchmark taught us about making multi-agent systems production-ready.*
 
 ---
 
@@ -64,7 +64,7 @@ Failures on the Planner step must not consume the Coder's retry budget. Each log
 
 ### Benchmark Evidence
 
-Across the 30-instance SWE-bench-Lite slice (N=3 per cell):
+Across the 10-instance SWE-bench-Lite slice (N=3 per cell):
 
 | Topology | Retry Budget Exhaustions | Avg Retries/Instance |
 |---|---|---|
@@ -191,7 +191,7 @@ Cause-tagged escalations make the HITL decision *actionable* — the operator se
 
 ## Topology Ablation: Results
 
-We ran 30 SWE-bench-Lite instances × 3 topologies × N=3 repetitions = **270 benchmark executions**, plus 90 custom-repo runs for a total of **360 runs**.
+We ran 10 SWE-bench-Lite instances × 3 topologies × N=3 repetitions = **90 benchmark executions** in the published `m6-full-matrix-001` result file.
 
 ### Success Rate
 
@@ -322,7 +322,7 @@ The mitigations are **independent** — each can fire without the others. They a
 All benchmark results are reproducible:
 
 - **Run ID**: `m6-full-matrix-001`
-- **Slice**: 30 SWE-bench-Lite instances
+- **Slice**: 10 SWE-bench-Lite instances
 - **N**: 3 runs per (topology, instance) cell
 - **Temperature**: 0.0 (deterministic)
 - **Models**: `deepseek/deepseek-v4-pro` (Planner), `deepseek/deepseek-chat-v3-0324` (Coder/Reviewer/QA)
@@ -332,4 +332,3 @@ All benchmark results are reproducible:
 To reproduce: `python3 -m src.benchmarks.swebench --matrix --slice 30 --runs 3 --temperature 0`
 
 ---
-

@@ -21,6 +21,7 @@ VAL-CROSS-018, VAL-CROSS-019.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import Any
@@ -135,6 +136,47 @@ def get_graph(task_id: str) -> _GraphEntry | None:
     return _active_graphs.get(task_id)
 
 
+async def _call_optional_async(obj: Any, method_name: str) -> None:
+    """Call a cleanup method that may be sync or async."""
+    method = getattr(obj, method_name, None)
+    if method is None:
+        return
+    result = method()
+    if inspect.isawaitable(result):
+        await result
+
+
+async def cleanup_task_runtime(task_id: str) -> None:
+    """Unregister and close task-scoped graph, sandbox, store, and guardrail resources."""
+    unregister_graph(task_id)
+
+    from src.orchestrator.supervisor_only import (
+        get_sandbox,
+        get_store,
+        unregister_guardrail,
+        unregister_sandbox,
+        unregister_semantic_store,
+        unregister_store,
+    )
+
+    sandbox = get_sandbox(task_id)
+    store = get_store(task_id)
+    semantic_store = unregister_semantic_store(task_id)
+
+    unregister_guardrail(task_id)
+    unregister_sandbox(task_id)
+    unregister_store(task_id)
+
+    if sandbox is not None:
+        await _call_optional_async(sandbox, "teardown")
+    if store is not None:
+        await _call_optional_async(store, "close")
+    if semantic_store is not None:
+        await _call_optional_async(semantic_store, "close")
+
+    logger.debug("Cleaned up runtime resources for task %s", task_id)
+
+
 async def resume_graph(task_id: str, decision: str) -> bool:
     """Resume a paused LangGraph with the given HITL decision.
 
@@ -182,10 +224,11 @@ async def resume_graph(task_id: str, decision: str) -> bool:
             # Graph completed — unregister and let the orchestrator
             # handle post-processing
             logger.info("Graph for task %s completed after HITL resume", task_id)
-            unregister_graph(task_id)
-
-            # Trigger post-graph processing (update outcomes, etc.)
-            await _post_graph_completion(task_id, result)
+            try:
+                # Trigger post-graph processing (update outcomes, etc.)
+                await _post_graph_completion(task_id, result)
+            finally:
+                await cleanup_task_runtime(task_id)
 
         return True
 

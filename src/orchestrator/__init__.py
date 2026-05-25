@@ -127,7 +127,7 @@ class OrchestratorState(BaseModel):
 
     # Peer-handoff tracking (hybrid topology — M4)
     # Counts the number of Coder⇄Reviewer peer handoffs
-    # (reject_with_changes loops via swarm edge, not through Supervisor)
+    # (reject_with_changes loops via peer edge, not through Supervisor)
     peer_handoff_count: int = 0
     # The span ID of the most recent Reviewer span, used as
     # the parent for the next peer-handoff Coder span

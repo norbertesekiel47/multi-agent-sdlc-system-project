@@ -758,3 +758,15 @@ class TestResultsAnalysisPipeline:
 
         content = readme_path.read_text()
         assert "supervisor_only" in content
+
+
+def test_published_m6_counts_match_recorded_instances() -> None:
+    """Published benchmark metadata must match the rows actually included."""
+    repo_root = Path(__file__).resolve().parents[2]
+    results_path = repo_root / "benchmarks" / "results" / "m6-full-matrix-001.json"
+    data = json.loads(results_path.read_text())
+
+    instance_counts = [len(cell.get("instances", [])) for cell in data["cells"]]
+    assert data["slice_size"] == min(instance_counts)
+    for cell in data["cells"]:
+        assert cell["n"] == len(cell["instances"])

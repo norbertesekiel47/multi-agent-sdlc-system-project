@@ -49,6 +49,7 @@ from src.api.models import (
 from src.logging.secret_filter import install_secret_filter
 from src.memory.episodic.models import CreateTaskParams
 from src.memory.episodic.store import EpisodicStore
+from src.orchestrator.hitl import cleanup_task_runtime
 from src.tracing.ws_broadcaster import get_trace_broadcaster
 
 # Load environment variables from .env at import time (before any config reads).
@@ -474,7 +475,7 @@ async def hitl_decision(
         await store.update_task_status(task_id, "approved")
 
         # Try to resume the orchestrator graph if it's checkpointed
-        await _resume_orchestrator_if_active(task_id, "approve")
+        resumed = await _resume_orchestrator_if_active(task_id, "approve")
 
         # Check current status (might have been updated by resumed graph)
         updated_task = await store.get_task(task_id)
@@ -482,7 +483,7 @@ async def hitl_decision(
 
         # If status is still 'approved' (graph didn't complete yet),
         # mark as running so the graph can continue
-        if final_status == "approved":
+        if resumed and final_status == "approved":
             await store.update_task_status(task_id, "running")
 
         logger.info(
@@ -519,6 +520,7 @@ async def hitl_decision(
                 detail={"reason": reason} if reason else {},
             )
         )
+        await cleanup_task_runtime(str(task_id))
 
         logger.info(
             "HITL reject for task %s, reason=%s",
@@ -533,15 +535,14 @@ async def hitl_decision(
         )
 
 
-async def _resume_orchestrator_if_active(task_id: UUID, decision: str) -> None:
+async def _resume_orchestrator_if_active(task_id: UUID, decision: str) -> bool:
     """Resume a paused LangGraph for the given task if it's checkpointed.
 
     Looks up the task's compiled graph and checkpointer, then resumes
     execution with the HITL decision.  This is the core of the
     interrupt/resume flow.
 
-    If no active graph is found (e.g., the task hasn't started yet
-    or the graph already completed), this is a no-op.
+    Returns False if no active graph is found or the resume fails.
     """
     from src.orchestrator.hitl import resume_graph
 
@@ -549,6 +550,7 @@ async def _resume_orchestrator_if_active(task_id: UUID, decision: str) -> None:
         resumed = await resume_graph(str(task_id), decision)
         if resumed:
             logger.info("Resumed graph for task %s with decision=%s", task_id, decision)
+        return resumed
     except Exception:
         logger.warning(
             "Failed to resume graph for task %s (decision=%s)",
@@ -556,6 +558,7 @@ async def _resume_orchestrator_if_active(task_id: UUID, decision: str) -> None:
             decision,
             exc_info=True,
         )
+        return False
 
 
 # ── WS /events/stream ────────────────────────────────────────────────

@@ -33,6 +33,7 @@ from src.agents.models import (
     ChangePlan,
     CodeEdit,
     ReviewResult,
+    TestReport,
 )
 from src.agents.reviewer import ReviewerRunResult
 from src.orchestrator import OrchestratorState
@@ -234,6 +235,100 @@ class TestSupervisorOnlyRouting:
         next_node = route_after_review(state)
         # After retry budget exhausted, should NOT route back to coder
         assert next_node != "run_coder"
+
+    def test_cost_budget_exhausted_halts_after_planner(self) -> None:
+        """Cost budget failures from Planner must not fall through to Coder."""
+        from src.orchestrator.supervisor_only import route_after_planner
+
+        state = OrchestratorState(outcome="cost_budget_exhausted", status="failed")
+        assert route_after_planner(state) == "halt_cost_budget_exhausted"
+
+    def test_cost_budget_exhausted_halts_after_coder(self) -> None:
+        """Cost budget failures from Coder must not fall through to Reviewer."""
+        from src.orchestrator.supervisor_only import route_after_coder
+
+        state = OrchestratorState(outcome="cost_budget_exhausted", status="failed")
+        assert route_after_coder(state) == "halt_cost_budget_exhausted"
+
+    def test_cost_budget_exhausted_halts_after_review(self) -> None:
+        """Cost budget failures from Reviewer must not fall through to QA."""
+        from src.orchestrator.supervisor_only import route_after_review
+
+        state = OrchestratorState(
+            outcome="cost_budget_exhausted",
+            status="failed",
+            review_result=ReviewResult(verdict="accept", issues=[], diff_hash="abc"),
+        )
+        assert route_after_review(state) == "halt_cost_budget_exhausted"
+
+    def test_cost_budget_exhausted_halts_after_qa(self) -> None:
+        """Cost budget failures from QA must not fall through to PR finalization."""
+        from src.orchestrator.supervisor_only import route_after_qa
+
+        state = OrchestratorState(
+            outcome="cost_budget_exhausted",
+            status="failed",
+            test_report=TestReport(passed=1, failed=0, failed_test_names=[]),
+        )
+        assert route_after_qa(state) == "halt_cost_budget_exhausted"
+
+    def test_commit_push_failure_does_not_route_to_open_pr(self) -> None:
+        """Commit/push failures must halt before the PR open node."""
+        from src.orchestrator.supervisor_only import route_after_commit_and_push
+
+        state = OrchestratorState(
+            outcome="github_delivery_failed",
+            status="failed",
+            errors=["Commit/push failed: denied"],
+        )
+        assert route_after_commit_and_push(state) == "halt_github_delivery_failed"
+
+
+class TestSupervisorOnlyGitHubDelivery:
+    """Regression coverage for terminal GitHub delivery failures."""
+
+    @pytest.mark.asyncio
+    async def test_open_pr_failure_returns_failed_outcome(self) -> None:
+        """A PR API exception must not be reported as a successful task."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from src.orchestrator.supervisor_only import run_open_pr
+
+        code_edit = CodeEdit(
+            diff=_SAMPLE_DIFF,
+            touched_files=["src/calculator.py"],
+            diff_hash="abc123",
+        )
+        state = OrchestratorState(
+            task_id=str(uuid4()),
+            repo_url="https://github.com/org/repo",
+            issue_number=42,
+            code_edit=code_edit,
+            trace_id="trace",
+            supervisor_span_id="span",
+        )
+        fake_client = MagicMock()
+        fake_client.open_pull_request.side_effect = RuntimeError("permission denied")
+
+        with patch(
+            "src.orchestrator.supervisor_only.get_sandbox",
+            return_value=SimpleNamespace(workspace_dir="/tmp/repo"),
+        ), patch(
+            "src.orchestrator.supervisor_only.GitHubClient",
+            return_value=fake_client,
+        ), patch(
+            "src.orchestrator.supervisor_only.get_tracing_client",
+            return_value=MagicMock(),
+        ), patch(
+            "src.orchestrator.supervisor_only._emit_trace_event",
+            new_callable=AsyncMock,
+        ):
+            result = await run_open_pr(state)
+
+        assert result["status"] == "failed"
+        assert result["outcome"] == "github_delivery_failed"
+        assert "PR open failed" in result["errors"][0]
 
 
 class TestSupervisorOnlySpanHierarchy:
@@ -542,6 +637,15 @@ class TestSupervisorOnlyGraphExecution:
             cached_tokens=1200,
             cost_usd=Decimal("0.03"),
         )
+        from src.agents.qa import QARunResult
+
+        mock_qa_result = QARunResult(
+            report=TestReport(passed=1, failed=0, failed_test_names=[]),
+            tokens_in=800,
+            tokens_out=150,
+            cached_tokens=300,
+            cost_usd=Decimal("0.02"),
+        )
 
         with ExitStack() as stack:
             stack.enter_context(
@@ -554,6 +658,21 @@ class TestSupervisorOnlyGraphExecution:
                 patch(
                     "src.agents.reviewer.run_reviewer",
                     return_value=mock_reviewer_result,
+                )
+            )
+            stack.enter_context(
+                patch("src.agents.qa.run_qa", return_value=mock_qa_result)
+            )
+            stack.enter_context(
+                patch(
+                    "src.orchestrator.supervisor_only.run_commit_and_push",
+                    return_value={"step": "committed"},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "src.orchestrator.supervisor_only.run_open_pr",
+                    return_value={"outcome": "success", "status": "completed"},
                 )
             )
             for p in self._mock_infrastructure():
@@ -653,6 +772,15 @@ class TestSupervisorOnlyGraphExecution:
             cached_tokens=1400,
             cost_usd=Decimal("0.04"),
         )
+        from src.agents.qa import QARunResult
+
+        mock_qa_result = QARunResult(
+            report=TestReport(passed=1, failed=0, failed_test_names=[]),
+            tokens_in=800,
+            tokens_out=150,
+            cached_tokens=300,
+            cost_usd=Decimal("0.02"),
+        )
 
         coder_call_count = 0
 
@@ -683,6 +811,21 @@ class TestSupervisorOnlyGraphExecution:
                 patch(
                     "src.agents.reviewer.run_reviewer",
                     side_effect=mock_review_fn,
+                )
+            )
+            stack.enter_context(
+                patch("src.agents.qa.run_qa", return_value=mock_qa_result)
+            )
+            stack.enter_context(
+                patch(
+                    "src.orchestrator.supervisor_only.run_commit_and_push",
+                    return_value={"step": "committed"},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "src.orchestrator.supervisor_only.run_open_pr",
+                    return_value={"outcome": "success", "status": "completed"},
                 )
             )
             for p in self._mock_infrastructure():

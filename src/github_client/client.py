@@ -81,6 +81,11 @@ def canonicalize_repo_url(url: str) -> str:
     return url
 
 
+def _strip_url_credentials(url: str) -> str:
+    """Remove userinfo from an HTTPS GitHub URL."""
+    return re.sub(r"^(https?://)[^/@]+@", r"\1", url.strip())
+
+
 def _extract_repo_slug(url: str) -> str:
     """Extract ``owner/repo`` from a GitHub URL.
 
@@ -130,6 +135,13 @@ class GitHubClient:
             self._gh = Github(auth=Token(self._pat))
         return self._gh
 
+    def _authenticated_url(self, repo_url: str) -> str:
+        """Return a one-shot authenticated HTTPS URL for git transport."""
+        canon_url = canonicalize_repo_url(_strip_url_credentials(repo_url))
+        if not self._pat:
+            return canon_url
+        return canon_url.replace("https://", f"https://{self._pat}@")
+
     # ── Clone ──────────────────────────────────────────────
 
     def clone(self, repo_url: str, dest: str) -> None:
@@ -139,10 +151,8 @@ class GitHubClient:
         Raises RepoNotFoundError if the repo does not exist (404).
         """
         canon_url = canonicalize_repo_url(repo_url)
-        # Build authenticated URL (PAT in URL for git clone)
-        auth_url = canon_url.replace(
-            "https://", f"https://{self._pat}@"
-        )
+        # Build authenticated URL (PAT in URL for this git invocation only).
+        auth_url = self._authenticated_url(canon_url)
 
         logger.info(
             "Cloning repo %s to %s",
@@ -169,6 +179,17 @@ class GitHubClient:
                 raise RepoNotFoundError(repo_url)
             # Redact any leaked PAT in the error message
             raise GitHubClientError(f"Clone failed: {_redact(stderr)}")
+
+        # git clone persists the clone URL as origin. Scrub the PAT-bearing URL
+        # immediately so .git/config and later diagnostics cannot leak it.
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", canon_url],
+            capture_output=True,
+            text=True,
+            cwd=dest,
+            check=True,
+            timeout=10,
+        )
 
         logger.info("Cloned repo %s successfully", _redact(canon_url))
 
@@ -235,10 +256,20 @@ class GitHubClient:
             timeout=10,
         )
 
-        # Push
+        origin_result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            cwd=repo_path,
+            check=True,
+            timeout=10,
+        )
+        push_url = self._authenticated_url(origin_result.stdout.strip())
+
+        # Push using a one-shot URL so the PAT is never written into origin.
         try:
             result = subprocess.run(
-                ["git", "push", "-u", "origin", branch_name],
+                ["git", "push", "-u", push_url, branch_name],
                 capture_output=True,
                 text=True,
                 cwd=repo_path,

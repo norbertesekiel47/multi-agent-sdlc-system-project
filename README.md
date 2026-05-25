@@ -56,9 +56,9 @@ Built across 6 milestones demonstrating production-grade multi-agent engineering
 
 ## Benchmark Results
 
-Full benchmark matrix: **3 topologies × 30 SWE-bench-Lite instances × N=3 runs** (≈270 executions).
+Full benchmark matrix: **3 topologies × 10 SWE-bench-Lite instances × N=3 runs** (≈90 executions).
 
-> Results below are from run `m6-full-matrix-001` with 30 instances, 3 runs per cell, temperature=0.
+> Results below are from run `m6-full-matrix-001` with 10 instances, 3 runs per cell, temperature=0.
 
 ### Results Summary
 
@@ -114,16 +114,23 @@ Cause-tagged HITL escalation counts per topology. Escalations are triggered dete
 
 ### Prerequisites
 
-- **Python 3.14+** (system default on this host)
-- **Node 24** (pnpm as package manager; Node 22 LTS via `fnm` for promptfoo only)
-- **Docker 29+** (daemon running; images pre-pulled: `pgvector/pgvector:pg17`, `langfuse/langfuse:3`)
-- **pnpm** — `corepack enable && corepack prepare pnpm@latest --activate`
-- **Credentials** in `.env` (copy from `.env.example`):
+- **macOS** with Docker Desktop running.
+- **Python 3.14+**. The project declares `requires-python = ">=3.14"`.
+- **Node 22+ or 24+** with pnpm via Corepack.
+- **Docker Compose**. The local stack starts Postgres/pgvector on `5433` and Langfuse on `3110`.
+- **Credentials** in `.env` at the repository root. Create it with `cp .env.example .env`.
   - `OPENROUTER_API_KEY` — LLM gateway
   - `OPENAI_API_KEY` — embeddings
   - `GITHUB_PAT` — repo clone/push/PR (needs `Contents:write`, `PullRequests:write`, `Issues:read`)
   - `GITHUB_USERNAME` — GitHub account
   - `HUGGINGFACE_TOKEN` — SWE-bench dataset access
+
+Enable pnpm before installing dependencies:
+
+```bash
+corepack enable
+corepack prepare pnpm@11.0.9 --activate
+```
 
 ### Environment
 
@@ -144,6 +151,7 @@ Cause-tagged HITL escalation counts per topology. Escalations are triggered dete
 git clone <repo-url> && cd MultiAgenticSystem
 cp .env.example .env   # Fill in real credentials
 bash init.sh            # Idempotent: venv, pip, pnpm, Docker images, compose up, DB schema
+source .venv/bin/activate
 ```
 
 `init.sh` does all of the following (safe to re-run):
@@ -159,43 +167,69 @@ bash init.sh            # Idempotent: venv, pip, pnpm, Docker images, compose up
 
 ```bash
 # If not using init.sh, install manually:
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
-pnpm install
+pnpm install --frozen-lockfile
 ```
 
 ### Run
 
 ```bash
-# Start Postgres + pgvector + Langfuse
+# Start Postgres + pgvector + Langfuse and its dependencies
 docker compose --env-file .env -f infra/docker-compose.yml up -d
 
 # Initialize database schema (first run only)
 python -m src.db.init_schema
 
-# Start backend
-uvicorn src.api.main:app --host 0.0.0.0 --port 3100
+# Start backend in one terminal
+python -m uvicorn src.api.main:app --host 0.0.0.0 --port 3100
 
 # Start dashboard (in another terminal)
-NEXT_PUBLIC_API_URL=http://localhost:3100 pnpm --filter web dev --port 3101
+NEXT_PUBLIC_API_URL=http://localhost:3100 pnpm dev
+
+# Health checks
+curl -fsS http://localhost:3100/health | python3 -m json.tool
+curl -fsS http://localhost:3101 >/dev/null
 ```
 
-### Test
+`/health` may return `status: "degraded"` if Langfuse keys are not configured yet. For task execution, `db` must be `ok`.
+
+### Build and Verify
 
 ```bash
-# Python test suite (pytest-xdist, 6 workers)
-pytest -q --maxfail=5 -n 6 tests/
+# Frontend production build from the repository root
+pnpm build
 
-# Sandbox isolation tests (must run serially — Docker networking constraints)
-pytest -v tests/sandbox/test_isolation.py
+# Lint and typecheck both Python and web code
+pnpm lint
+pnpm typecheck
 
-# Type check
-mypy --strict src/
+# Local test suite, excluding tests that need external network credentials
+pytest -q -m "not integration"
 
-# Lint
-ruff check src/ tests/
+# Full Python test suite. Requires Docker, local Postgres, and external credentials.
+pytest -q tests
 
-# Frontend tests
-pnpm --filter web test
+# Sandbox isolation tests must run serially because they create Docker networks.
+pytest -q tests/sandbox/test_isolation.py
+```
+
+The root pnpm scripts are thin wrappers. `pnpm build` builds the Next.js dashboard; backend verification is covered by `pnpm lint`, `pnpm typecheck`, and pytest.
+
+### Demo
+
+Use the walkthrough in [docs/demo/demo-walkthrough.md](docs/demo/demo-walkthrough.md). The helper script can either start the local stack or attach to an already running one:
+
+```bash
+# Start services, submit the task, and guide the HITL step
+bash docs/demo/record-demo.sh
+
+# Reuse already-running backend/dashboard services
+bash docs/demo/record-demo.sh --skip-setup
+
+# Fully unattended HITL approval for a dry run
+bash docs/demo/record-demo.sh --auto-approve
 ```
 
 ---

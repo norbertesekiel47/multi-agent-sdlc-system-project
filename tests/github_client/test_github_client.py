@@ -72,6 +72,62 @@ def _make_client(pat: str, username: str):
     return GitHubClient(pat=pat, username=username)
 
 
+def test_clone_scrubs_authenticated_origin_remote() -> None:
+    """clone() must not leave a PAT-bearing URL in .git/config."""
+    client = _make_client("ghp_fake_secret_token", "octocat")
+    dest = "/tmp/repo"
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        client.clone("https://github.com/org/repo.git", dest)
+
+    mock_run.assert_any_call(
+        ["git", "remote", "set-url", "origin", "https://github.com/org/repo"],
+        capture_output=True,
+        text=True,
+        cwd=dest,
+        check=True,
+        timeout=10,
+    )
+    set_url_calls = [
+        call
+        for call in mock_run.call_args_list
+        if call.args and call.args[0][:3] == ["git", "remote", "set-url"]
+    ]
+    assert set_url_calls, "clone() should scrub origin after authenticated clone"
+    for call in set_url_calls:
+        assert "ghp_fake_secret_token" not in repr(call)
+
+
+def test_commit_and_push_uses_authenticated_url_without_mutating_origin() -> None:
+    """Push should authenticate without writing the PAT into the origin remote."""
+    client = _make_client("ghp_fake_secret_token", "octocat")
+
+    def _run_side_effect(cmd: list[str], **_: object) -> MagicMock:
+        if cmd[:3] == ["git", "remote", "get-url"]:
+            return MagicMock(stdout="https://github.com/org/repo\n", returncode=0, stderr="")
+        return MagicMock(returncode=0, stderr="", stdout="")
+
+    with patch("subprocess.run", side_effect=_run_side_effect) as mock_run:
+        client.commit_and_push("/tmp/repo", "sdlc-swarm/fix-1", "fix: issue")
+
+    push_calls = [
+        call
+        for call in mock_run.call_args_list
+        if call.args and call.args[0][:2] == ["git", "push"]
+    ]
+    assert len(push_calls) == 1
+    push_cmd = push_calls[0].args[0]
+    assert "ghp_fake_secret_token" in push_cmd[3]
+
+    set_url_calls = [
+        call
+        for call in mock_run.call_args_list
+        if call.args and call.args[0][:3] == ["git", "remote", "set-url"]
+    ]
+    assert set_url_calls == []
+
+
 # ===========================================================================
 # VAL-GH-CLIENT-001: clone uses PAT auth successfully
 # ===========================================================================

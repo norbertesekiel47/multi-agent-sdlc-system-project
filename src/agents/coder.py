@@ -553,7 +553,8 @@ async def run_coder(
             await sandbox_manager.apply_diff(edit.diff)
             logger.info("Applied Coder diff to sandbox for task %s", task_id)
         except Exception as exc:
-            logger.warning("Sandbox apply_diff failed: %s", exc)
+            logger.error("Sandbox apply_diff failed: %s", exc)
+            raise
 
     # ── Persist the CodeEdit if a store is available ────────────
     if episodic_store is not None:

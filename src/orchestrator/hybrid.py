@@ -1,7 +1,6 @@
-"""LangGraph hybrid topology — supervisor routing + Coder ⇄ Reviewer peer (swarm) handoff.
+"""LangGraph hybrid topology — supervisor routing + Coder ⇄ Reviewer peer handoff.
 
-Same as supervisor_only plus peer (swarm) handoff between Coder ⇄ Reviewer
-using ``create_swarm`` primitives from the ``langgraph_swarm`` package.
+Same as supervisor_only plus a typed peer handoff between Coder ⇄ Reviewer.
 When Reviewer returns ``reject_with_changes``, the handoff goes directly
 Reviewer → Coder (peer edge) rather than through the Supervisor.
 
@@ -15,7 +14,7 @@ Topology comparison (§5)::
     single_agent     1 agent, linear
     supervisor_only  4 agents, Supervisor routes all, no peer edges
     hybrid           4 agents, Supervisor routes most,
-                    but Coder⇄Reviewer uses swarm peer handoff
+                    but Coder⇄Reviewer uses peer handoff
 
 Span hierarchy for hybrid (accept path — same as supervisor_only)::
 
@@ -38,7 +37,7 @@ Span hierarchy for hybrid (reject_with_changes path — peer handoff)::
 VAL-TOPOLOGY-004: In hybrid, on a task that requires at least one
 fix-review cycle, the trace contains at least one Reviewer→Coder
 transition where the Coder span's parent is the Reviewer span
-(swarm peer handoff), not the Supervisor.
+(peer handoff), not the Supervisor.
 
 VAL-TOPOLOGY-005: When Reviewer issues reject_with_changes twice
 in a row, the trace contains the sequence
@@ -55,12 +54,6 @@ from uuid import UUID, uuid4
 
 from langgraph.graph import END, START, StateGraph
 
-# Swarm primitives — used for conceptual design of the peer-handoff
-# mechanism.  The create_swarm / create_handoff_tool APIs define the
-# pattern we implement: agents hand off to each other directly (peer
-# edge) rather than through a central router.
-from langgraph_swarm import create_handoff_tool, create_swarm  # noqa: F401
-
 from src.agents.models import CodeEdit, ReviewResult
 from src.guardrails.errors import GuardrailViolation
 from src.llm.cost import get_max_cost_per_task
@@ -71,11 +64,15 @@ from src.orchestrator.supervisor_only import (
     _trunc_json,
     get_sandbox,
     get_store,
+    halt_cost_budget_exhausted,
+    halt_github_delivery_failed,
     halt_retry_exhausted,
+    halt_task_failed,
     halt_test_failure,
     hitl_pre_commit_push,
     hitl_pre_pr,
     index_repo,
+    route_after_commit_and_push,
     run_commit_and_push,
     run_open_pr,
     run_planner,
@@ -143,6 +140,8 @@ logger = logging.getLogger(__name__)
 def route_after_review_hybrid(
     state: OrchestratorState,
 ) -> Literal[
+    "halt_cost_budget_exhausted",
+    "halt_task_failed",
     "hitl_guardrail_escalation",
     "hitl_loop_detected",
     "hitl_uncertainty_escalation",
@@ -155,9 +154,11 @@ def route_after_review_hybrid(
 
     Same as supervisor_only's route_after_review EXCEPT:
     - ``reject_with_changes``: route to **run_peer_coder** (peer
-      handoff via swarm edge, NOT through Supervisor).
+      handoff via peer edge, NOT through Supervisor).
     All other routing is the same.
     """
+    if state.outcome == "cost_budget_exhausted":
+        return "halt_cost_budget_exhausted"
     # Check for guardrail violations first
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
@@ -167,6 +168,8 @@ def route_after_review_hybrid(
     # Check for uncertainty escalation
     if state.outcome == "uncertainty_escalation":
         return "hitl_uncertainty_escalation"
+    if state.status == "failed":
+        return "halt_task_failed"
 
     review = state.review_result
     if review is None:
@@ -195,7 +198,7 @@ def route_after_review_hybrid(
             )
             return "halt_retry_exhausted"
 
-        # VAL-TOPOLOGY-004: Route to peer Coder (swarm handoff)
+        # VAL-TOPOLOGY-004: Route to peer Coder.
         logger.info(
             "Peer-handoff to Coder after reject_with_changes "
             "(attempt %d/%d, handoff #%d)",
@@ -216,6 +219,8 @@ def route_after_review_hybrid(
 def route_after_qa_hybrid(
     state: OrchestratorState,
 ) -> Literal[
+    "halt_cost_budget_exhausted",
+    "halt_task_failed",
     "hitl_guardrail_escalation",
     "hitl_loop_detected",
     "hitl_uncertainty_escalation",
@@ -223,6 +228,8 @@ def route_after_qa_hybrid(
     "halt_test_failure",
 ]:
     """After QA, route based on test results (same as supervisor_only)."""
+    if state.outcome == "cost_budget_exhausted":
+        return "halt_cost_budget_exhausted"
     # Check for guardrail violations first
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
@@ -232,6 +239,8 @@ def route_after_qa_hybrid(
     # Check for uncertainty escalation
     if state.outcome == "uncertainty_escalation":
         return "hitl_uncertainty_escalation"
+    if state.status == "failed":
+        return "halt_task_failed"
 
     report = state.test_report
     if report is None:
@@ -250,18 +259,24 @@ def route_after_qa_hybrid(
 def route_after_peer_coder(
     state: OrchestratorState,
 ) -> Literal[
+    "halt_cost_budget_exhausted",
+    "halt_task_failed",
     "hitl_guardrail_escalation",
     "hitl_loop_detected",
     "hitl_uncertainty_escalation",
     "run_reviewer",
 ]:
     """After peer Coder, route to guardrail/loop/uncertainty escalation or Reviewer."""
+    if state.outcome == "cost_budget_exhausted":
+        return "halt_cost_budget_exhausted"
     if state.outcome == "guardrail_block":
         return "hitl_guardrail_escalation"
     if state.outcome == "loop_detected":
         return "hitl_loop_detected"
     if state.outcome == "uncertainty_escalation":
         return "hitl_uncertainty_escalation"
+    if state.status == "failed":
+        return "halt_task_failed"
     return "run_reviewer"
 
 
@@ -276,7 +291,7 @@ async def run_reviewer_hybrid(state: OrchestratorState) -> dict[str, Any]:
       so the peer Coder can use it as its parent span
     - Increments ``peer_handoff_count`` for tracking
 
-    This is the key enabler for the swarm peer-handoff:
+    This is the key enabler for the peer handoff:
     when the next Coder span uses the Reviewer span as parent,
     the Langfuse trace shows a direct Reviewer → Coder parent edge.
     """
@@ -456,7 +471,7 @@ async def run_reviewer_hybrid(state: OrchestratorState) -> dict[str, Any]:
     return result
 
 
-# ── Node: Peer Coder (swarm handoff) ───────────────────────────────
+# ── Node: Peer Coder handoff ───────────────────────────────────────
 
 
 async def run_peer_coder(state: OrchestratorState) -> dict[str, Any]:
@@ -465,8 +480,8 @@ async def run_peer_coder(state: OrchestratorState) -> dict[str, Any]:
     This is the KEY differentiator from supervisor_only.  The Coder
     span's parent is the Reviewer span (not the Supervisor span),
     creating a direct Reviewer → Coder parent edge in the Langfuse
-    trace.  This implements the swarm peer-handoff concept from
-    ``create_swarm`` / ``create_handoff_tool``.
+    trace. This implements the typed peer-handoff behavior used by
+    the hybrid topology.
 
     VAL-TOPOLOGY-004: On a task with at least one fix-review cycle,
     the trace contains at least one Coder span whose parent span
@@ -511,7 +526,7 @@ async def run_peer_coder(state: OrchestratorState) -> dict[str, Any]:
             "task_id": task_id,
             "agent_name": "coder",
             "retry": current_retries,
-            "handoff_type": "peer",  # Marks this as a swarm peer-handoff
+            "handoff_type": "peer",
             "parent_agent_name": "reviewer",
             "peer_handoff_count": state.peer_handoff_count + 1,
             "topology": "hybrid",
@@ -707,9 +722,8 @@ async def _run_reviewer_agent(
 def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
     """Build the LangGraph state machine for the hybrid topology.
 
-    Same as supervisor_only PLUS peer (swarm) handoff between
-    Coder ⇄ Reviewer.  The graph uses ``create_swarm`` primitives
-    for the peer-handoff segment:
+    Same as supervisor_only PLUS typed peer handoff between
+    Coder ⇄ Reviewer:
 
     - When Reviewer returns ``accept``: routes to QA (same as
       supervisor_only)
@@ -753,6 +767,9 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
     graph.add_node("run_reviewer", run_reviewer_hybrid)  # Hybrid Reviewer
     graph.add_node("run_qa", run_qa)
     graph.add_node("run_supervisor_finalize", run_supervisor_finalize)
+    graph.add_node("halt_cost_budget_exhausted", halt_cost_budget_exhausted)
+    graph.add_node("halt_github_delivery_failed", halt_github_delivery_failed)
+    graph.add_node("halt_task_failed", halt_task_failed)
     graph.add_node("halt_retry_exhausted", halt_retry_exhausted)
     graph.add_node("halt_test_failure", halt_test_failure)
 
@@ -786,6 +803,8 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_planner",
         route_after_planner,
         {
+            "halt_cost_budget_exhausted": "halt_cost_budget_exhausted",
+            "halt_task_failed": "halt_task_failed",
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "hitl_loop_detected": "hitl_loop_detected",
             "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
@@ -798,6 +817,8 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_coder",
         route_after_coder,
         {
+            "halt_cost_budget_exhausted": "halt_cost_budget_exhausted",
+            "halt_task_failed": "halt_task_failed",
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "hitl_loop_detected": "hitl_loop_detected",
             "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
@@ -810,6 +831,8 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_reviewer",
         route_after_review_hybrid,
         {
+            "halt_cost_budget_exhausted": "halt_cost_budget_exhausted",
+            "halt_task_failed": "halt_task_failed",
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "hitl_loop_detected": "hitl_loop_detected",
             "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
@@ -827,6 +850,8 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_peer_coder",
         route_after_peer_coder,
         {
+            "halt_cost_budget_exhausted": "halt_cost_budget_exhausted",
+            "halt_task_failed": "halt_task_failed",
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "hitl_loop_detected": "hitl_loop_detected",
             "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
@@ -839,6 +864,8 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
         "run_qa",
         route_after_qa_hybrid,
         {
+            "halt_cost_budget_exhausted": "halt_cost_budget_exhausted",
+            "halt_task_failed": "halt_task_failed",
             "hitl_guardrail_escalation": "hitl_guardrail_escalation",
             "hitl_loop_detected": "hitl_loop_detected",
             "hitl_uncertainty_escalation": "hitl_uncertainty_escalation",
@@ -855,10 +882,20 @@ def build_hybrid_graph() -> StateGraph:  # type: ignore[type-arg]
         graph.add_edge("run_supervisor_finalize", "hitl_pre_pr")
 
     graph.add_edge("hitl_pre_pr", "run_commit_and_push")
-    graph.add_edge("run_commit_and_push", "run_open_pr")
+    graph.add_conditional_edges(
+        "run_commit_and_push",
+        route_after_commit_and_push,
+        {
+            "run_open_pr": "run_open_pr",
+            "halt_github_delivery_failed": "halt_github_delivery_failed",
+        },
+    )
     graph.add_edge("run_open_pr", END)
 
     # Halt nodes → END
+    graph.add_edge("halt_cost_budget_exhausted", END)
+    graph.add_edge("halt_github_delivery_failed", END)
+    graph.add_edge("halt_task_failed", END)
     graph.add_edge("halt_retry_exhausted", END)
     graph.add_edge("halt_test_failure", END)
 

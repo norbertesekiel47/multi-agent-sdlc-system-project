@@ -479,6 +479,102 @@ def test_hitl_decision_reject_ends_task_without_pr() -> None:
         assert task_data["hitl_decision"] == "reject"
 
 
+@pytest.mark.asyncio
+async def test_cleanup_task_runtime_tears_down_registered_resources() -> None:
+    """HITL rejection cleanup must unregister graphs and close task-scoped resources."""
+    from src.orchestrator.hitl import cleanup_task_runtime, get_graph, register_graph
+    from src.orchestrator.supervisor_only import (
+        get_sandbox,
+        get_semantic_store,
+        get_store,
+        register_sandbox,
+        register_semantic_store,
+        register_store,
+    )
+
+    class FakeClosable:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class FakeSandbox:
+        def __init__(self) -> None:
+            self.torn_down = False
+
+        async def teardown(self) -> None:
+            self.torn_down = True
+
+    task_id = str(uuid4())
+    sandbox = FakeSandbox()
+    store = FakeClosable()
+    semantic_store = FakeClosable()
+
+    register_graph(task_id, object(), "thread", MemorySaver())  # type: ignore[arg-type]
+    register_sandbox(task_id, sandbox)  # type: ignore[arg-type]
+    register_store(task_id, store)  # type: ignore[arg-type]
+    register_semantic_store(task_id, semantic_store)  # type: ignore[arg-type]
+
+    await cleanup_task_runtime(task_id)
+
+    assert get_graph(task_id) is None
+    assert get_sandbox(task_id) is None
+    assert get_store(task_id) is None
+    assert get_semantic_store(task_id) is None
+    assert sandbox.torn_down is True
+    assert store.closed is True
+    assert semantic_store.closed is True
+
+
+@pytest.mark.usefixtures("_patch_env")
+def test_hitl_decision_reject_cleans_up_runtime_resources() -> None:
+    """Rejecting through the API must tear down the paused graph runtime."""
+    from unittest.mock import AsyncMock, patch
+
+    from src.api.main import app
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/tasks",
+            json={
+                "repo_url": "https://github.com/test/repo-cleanup",
+                "issue_number": 15,
+                "issue_text": "Test cleanup on reject",
+                "topology": "supervisor_only",
+                "auto_start": False,
+            },
+        )
+        assert resp.status_code == 201
+        task_id = resp.json()["id"]
+
+        import asyncio
+
+        from src.memory.episodic.store import EpisodicStore
+
+        async def _set_awaiting() -> None:
+            store = EpisodicStore()
+            await store.connect()
+            try:
+                await store.update_task_status(UUID(task_id), "awaiting_hitl")
+            finally:
+                await store.close()
+
+        asyncio.run(_set_awaiting())
+
+        with patch(
+            "src.api.main.cleanup_task_runtime",
+            new_callable=AsyncMock,
+        ) as cleanup:
+            resp = client.post(
+                f"/tasks/{task_id}/hitl/decision",
+                json={"decision": "reject", "reason": "stop"},
+            )
+
+        assert resp.status_code == 200
+        cleanup.assert_awaited_once_with(task_id)
+
+
 # ── VAL-HITL-CTRL-004: POST approve resumes the LangGraph ─────────────
 
 

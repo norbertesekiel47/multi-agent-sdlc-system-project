@@ -13,7 +13,7 @@ topologies:
     use_case: "Mid baseline"
 
   hybrid:
-    description: "Supervisor routes; Coder <-> Reviewer peer handoff via swarm"
+    description: "Supervisor routes; Coder <-> Reviewer typed peer handoff"
     agents: [planner, coder, reviewer, qa, supervisor]
     routing: sequential_with_peer_handoff
     peer_handoff:

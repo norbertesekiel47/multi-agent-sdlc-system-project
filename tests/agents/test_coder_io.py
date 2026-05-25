@@ -339,6 +339,42 @@ class TestCoderAppliesDiffViaSandbox:
         result = await _sandbox_apply_diff(mock_ctx, "diff")
         assert "not available" in result
 
+    @pytest.mark.asyncio
+    async def test_run_coder_raises_when_sandbox_apply_diff_fails(self) -> None:
+        """run_coder must not return a successful CodeEdit if the patch was not applied."""
+        from decimal import Decimal
+
+        from src.agents.coder import run_coder
+
+        sandbox = AsyncMock()
+        sandbox.read_file.return_value = "def subtract(a, b):\n    return a + b\n"
+        sandbox.apply_diff.side_effect = RuntimeError("patch failed")
+
+        mock_llm_result = MagicMock()
+        mock_llm_result.content = (
+            '```json\n'
+            '{"diff": "--- a/src/calculator.py\\n+++ b/src/calculator.py\\n'
+            '@@ -1 +1 @@\\n-old\\n+new\\n", '
+            '"touched_files": ["src/calculator.py"], "diff_hash": "abc123"}\n'
+            '```'
+        )
+        mock_llm_result.usage_input = 100
+        mock_llm_result.usage_output = 50
+        mock_llm_result.cached_tokens = 0
+        mock_llm_result.cost_usd = Decimal("0.01")
+
+        with patch("src.agents.coder.get_llm_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.chat_with_cache.return_value = mock_llm_result
+            mock_get_client.return_value = mock_client
+
+            with pytest.raises(RuntimeError, match="patch failed"):
+                await run_coder(
+                    change_plan=_make_change_plan(),
+                    sandbox_manager=sandbox,
+                    task_id=uuid4(),
+                )
+
 
 # ── VAL-CODER-006: CodeEdit persisted with diff_hash ────────────────
 

@@ -6,6 +6,8 @@ settings:
 
 importers:
 
+  .: {}
+
   web:
     dependencies:
       '@radix-ui/react-label':

@@ -6,6 +6,7 @@ VAL-REPRO-004, VAL-BACKEND-API-001.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -95,6 +96,16 @@ def test_pnpm_workspace_allows_required_builds() -> None:
 def test_pnpm_lock_yaml_exists() -> None:
     """VAL-REPRO-002: pnpm-lock.yaml must exist at workspace root."""
     assert (REPO_ROOT / "pnpm-lock.yaml").is_file(), "pnpm-lock.yaml missing"
+
+
+def test_root_package_json_exposes_common_commands() -> None:
+    """Root pnpm scripts must match documented repository commands."""
+    package_json = REPO_ROOT / "package.json"
+    assert package_json.is_file(), "package.json missing at repo root"
+    data = json.loads(package_json.read_text())
+    scripts = data.get("scripts", {})
+    for script in ("dev", "build", "lint", "typecheck", "test", "test:e2e"):
+        assert script in scripts, f"package.json missing {script} script"
 
 
 # ──────────────────────────────────────────────
