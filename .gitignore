@@ -47,7 +47,9 @@ langfuse-data/
 mission-artifacts/runs/
 mission-artifacts/**/runs/
 swebench-cache/
-benchmarks/results/
+# Local benchmark run outputs (the committed sample is force-added; see benchmarks/README.md)
+benchmarks/results/*
+!benchmarks/results/m6-full-matrix-001.json
 
 # ── Promptfoo eval output ──
 .promptfoo/

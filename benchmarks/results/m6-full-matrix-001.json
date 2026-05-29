@@ -1,0 +1,109 @@
+{
+  "run_id": "m6-full-matrix-001",
+  "started_at": "2026-05-24T08:00:00Z",
+  "ended_at": "2026-05-24T20:00:00Z",
+  "slice_size": 10,
+  "runs_per_cell": 3,
+  "cells": [
+    {
+      "topology": "single_agent",
+      "model": "deepseek/deepseek-chat-v3-0324",
+      "n": 10,
+      "mean": 0.1333,
+      "variance": 0.0123,
+      "ci_low": 0.0528,
+      "ci_high": 0.2138,
+      "cost_caching_off_usd": 0.38,
+      "cost_caching_on_usd": 0.32,
+      "avg_total_tokens_in": 4200.0,
+      "avg_total_tokens_out": 1200.0,
+      "avg_total_tokens_cached": 800.0,
+      "avg_duration_seconds": 32.5,
+      "avg_retry_count": 0.2,
+      "avg_peer_handoff_count": 0.0,
+      "hitl_escalation_summary": {
+        "retry_budget_exhausted": 2,
+        "cost_budget_exhausted": 1
+      },
+      "instances": [
+        {"instance_id": "django__django-16379", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.32, "avg_cost_caching_on_usd": 0.28, "avg_total_tokens_in": 3800.0, "avg_total_tokens_out": 1100.0, "avg_total_tokens_cached": 700.0, "avg_duration_seconds": 28.3, "avg_retry_count": 0.0, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "django__django-15811", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.40, "avg_cost_caching_on_usd": 0.34, "avg_total_tokens_in": 4500.0, "avg_total_tokens_out": 1300.0, "avg_total_tokens_cached": 900.0, "avg_duration_seconds": 35.2, "avg_retry_count": 0.33, "avg_peer_handoff_count": 0.0, "hitl_escalations": [{"cause": "retry_budget_exhausted", "trigger": "retry_budget_exhausted", "agent": "single_agent"}]},
+        {"instance_id": "flask__flask-4817", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.36, "avg_cost_caching_on_usd": 0.30, "avg_total_tokens_in": 4000.0, "avg_total_tokens_out": 1150.0, "avg_total_tokens_cached": 750.0, "avg_duration_seconds": 30.0, "avg_retry_count": 0.0, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "requests__requests-6028", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.42, "avg_cost_caching_on_usd": 0.35, "avg_total_tokens_in": 4800.0, "avg_total_tokens_out": 1350.0, "avg_total_tokens_cached": 950.0, "avg_duration_seconds": 38.1, "avg_retry_count": 0.67, "avg_peer_handoff_count": 0.0, "hitl_escalations": [{"cause": "cost_budget_exhausted", "trigger": "cost_budget_exhausted", "agent": "single_agent"}]},
+        {"instance_id": "scikit-learn__scikit-learn-13241", "success_rate": 0.6667, "avg_cost_caching_off_usd": 0.35, "avg_cost_caching_on_usd": 0.30, "avg_total_tokens_in": 3900.0, "avg_total_tokens_out": 1100.0, "avg_total_tokens_cached": 700.0, "avg_duration_seconds": 29.5, "avg_retry_count": 0.0, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "sympy__sympy-20049", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.44, "avg_cost_caching_on_usd": 0.37, "avg_total_tokens_in": 5000.0, "avg_total_tokens_out": 1400.0, "avg_total_tokens_cached": 1000.0, "avg_duration_seconds": 40.0, "avg_retry_count": 0.33, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "django__django-15388", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.38, "avg_cost_caching_on_usd": 0.32, "avg_total_tokens_in": 4300.0, "avg_total_tokens_out": 1200.0, "avg_total_tokens_cached": 850.0, "avg_duration_seconds": 33.0, "avg_retry_count": 0.0, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "flask__flask-4992", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.36, "avg_cost_caching_on_usd": 0.30, "avg_total_tokens_in": 4100.0, "avg_total_tokens_out": 1150.0, "avg_total_tokens_cached": 800.0, "avg_duration_seconds": 31.2, "avg_retry_count": 0.0, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "requests__requests-8694", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.40, "avg_cost_caching_on_usd": 0.34, "avg_total_tokens_in": 4500.0, "avg_total_tokens_out": 1250.0, "avg_total_tokens_cached": 850.0, "avg_duration_seconds": 34.5, "avg_retry_count": 0.33, "avg_peer_handoff_count": 0.0, "hitl_escalations": [{"cause": "retry_budget_exhausted", "trigger": "retry_budget_exhausted", "agent": "single_agent"}]},
+        {"instance_id": "matplotlib__matplotlib-23314", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.42, "avg_cost_caching_on_usd": 0.35, "avg_total_tokens_in": 4700.0, "avg_total_tokens_out": 1300.0, "avg_total_tokens_cached": 900.0, "avg_duration_seconds": 36.0, "avg_retry_count": 0.0, "avg_peer_handoff_count": 0.0, "hitl_escalations": []}
+      ]
+    },
+    {
+      "topology": "supervisor_only",
+      "model": "deepseek/deepseek-chat-v3-0324",
+      "n": 10,
+      "mean": 0.3000,
+      "variance": 0.0210,
+      "ci_low": 0.1954,
+      "ci_high": 0.4046,
+      "cost_caching_off_usd": 0.62,
+      "cost_caching_on_usd": 0.45,
+      "avg_total_tokens_in": 6400.0,
+      "avg_total_tokens_out": 1850.0,
+      "avg_total_tokens_cached": 2800.0,
+      "avg_duration_seconds": 55.3,
+      "avg_retry_count": 0.5,
+      "avg_peer_handoff_count": 0.0,
+      "hitl_escalation_summary": {
+        "uncertainty_escalation": 2,
+        "loop_detected": 1,
+        "retry_budget_exhausted": 1
+      },
+      "instances": [
+        {"instance_id": "django__django-16379", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.58, "avg_cost_caching_on_usd": 0.42, "avg_total_tokens_in": 6000.0, "avg_total_tokens_out": 1700.0, "avg_total_tokens_cached": 2500.0, "avg_duration_seconds": 50.0, "avg_retry_count": 0.33, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "django__django-15811", "success_rate": 0.6667, "avg_cost_caching_off_usd": 0.68, "avg_cost_caching_on_usd": 0.49, "avg_total_tokens_in": 7000.0, "avg_total_tokens_out": 2000.0, "avg_total_tokens_cached": 3200.0, "avg_duration_seconds": 60.5, "avg_retry_count": 0.33, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "flask__flask-4817", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.60, "avg_cost_caching_on_usd": 0.43, "avg_total_tokens_in": 6200.0, "avg_total_tokens_out": 1800.0, "avg_total_tokens_cached": 2700.0, "avg_duration_seconds": 52.0, "avg_retry_count": 0.67, "avg_peer_handoff_count": 0.0, "hitl_escalations": [{"cause": "loop_detected", "trigger": "loop_detected", "agent": "coder"}]},
+        {"instance_id": "requests__requests-6028", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.65, "avg_cost_caching_on_usd": 0.47, "avg_total_tokens_in": 6600.0, "avg_total_tokens_out": 1900.0, "avg_total_tokens_cached": 3000.0, "avg_duration_seconds": 58.0, "avg_retry_count": 1.0, "avg_peer_handoff_count": 0.0, "hitl_escalations": [{"cause": "uncertainty_escalation", "trigger": "pydantic_validation_3x", "agent": "reviewer"}]},
+        {"instance_id": "scikit-learn__scikit-learn-13241", "success_rate": 0.6667, "avg_cost_caching_off_usd": 0.55, "avg_cost_caching_on_usd": 0.40, "avg_total_tokens_in": 5800.0, "avg_total_tokens_out": 1650.0, "avg_total_tokens_cached": 2400.0, "avg_duration_seconds": 48.0, "avg_retry_count": 0.0, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "sympy__sympy-20049", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.72, "avg_cost_caching_on_usd": 0.52, "avg_total_tokens_in": 7400.0, "avg_total_tokens_out": 2100.0, "avg_total_tokens_cached": 3400.0, "avg_duration_seconds": 65.0, "avg_retry_count": 0.67, "avg_peer_handoff_count": 0.0, "hitl_escalations": [{"cause": "uncertainty_escalation", "trigger": "same_fix_rejected_twice", "agent": "reviewer"}]},
+        {"instance_id": "django__django-15388", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.62, "avg_cost_caching_on_usd": 0.45, "avg_total_tokens_in": 6400.0, "avg_total_tokens_out": 1850.0, "avg_total_tokens_cached": 2800.0, "avg_duration_seconds": 55.0, "avg_retry_count": 0.33, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "flask__flask-4992", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.58, "avg_cost_caching_on_usd": 0.42, "avg_total_tokens_in": 6000.0, "avg_total_tokens_out": 1750.0, "avg_total_tokens_cached": 2600.0, "avg_duration_seconds": 51.0, "avg_retry_count": 0.0, "avg_peer_handoff_count": 0.0, "hitl_escalations": []},
+        {"instance_id": "requests__requests-8694", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.60, "avg_cost_caching_on_usd": 0.43, "avg_total_tokens_in": 6200.0, "avg_total_tokens_out": 1800.0, "avg_total_tokens_cached": 2800.0, "avg_duration_seconds": 53.5, "avg_retry_count": 0.67, "avg_peer_handoff_count": 0.0, "hitl_escalations": [{"cause": "retry_budget_exhausted", "trigger": "retry_budget_exhausted", "agent": "coder"}]},
+        {"instance_id": "matplotlib__matplotlib-23314", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.58, "avg_cost_caching_on_usd": 0.42, "avg_total_tokens_in": 6000.0, "avg_total_tokens_out": 1750.0, "avg_total_tokens_cached": 2600.0, "avg_duration_seconds": 50.5, "avg_retry_count": 0.33, "avg_peer_handoff_count": 0.0, "hitl_escalations": []}
+      ]
+    },
+    {
+      "topology": "hybrid",
+      "model": "deepseek/deepseek-chat-v3-0324",
+      "n": 10,
+      "mean": 0.3667,
+      "variance": 0.0235,
+      "ci_low": 0.2554,
+      "ci_high": 0.4779,
+      "cost_caching_off_usd": 0.80,
+      "cost_caching_on_usd": 0.57,
+      "avg_total_tokens_in": 7800.0,
+      "avg_total_tokens_out": 2300.0,
+      "avg_total_tokens_cached": 3600.0,
+      "avg_duration_seconds": 68.7,
+      "avg_retry_count": 0.4,
+      "avg_peer_handoff_count": 1.3,
+      "hitl_escalation_summary": {
+        "loop_detected": 2,
+        "uncertainty_escalation": 1
+      },
+      "instances": [
+        {"instance_id": "django__django-16379", "success_rate": 0.6667, "avg_cost_caching_off_usd": 0.75, "avg_cost_caching_on_usd": 0.53, "avg_total_tokens_in": 7300.0, "avg_total_tokens_out": 2100.0, "avg_total_tokens_cached": 3200.0, "avg_duration_seconds": 62.0, "avg_retry_count": 0.0, "avg_peer_handoff_count": 1.0, "hitl_escalations": []},
+        {"instance_id": "django__django-15811", "success_rate": 0.6667, "avg_cost_caching_off_usd": 0.85, "avg_cost_caching_on_usd": 0.60, "avg_total_tokens_in": 8200.0, "avg_total_tokens_out": 2400.0, "avg_total_tokens_cached": 3800.0, "avg_duration_seconds": 72.5, "avg_retry_count": 0.33, "avg_peer_handoff_count": 1.5, "hitl_escalations": []},
+        {"instance_id": "flask__flask-4817", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.82, "avg_cost_caching_on_usd": 0.58, "avg_total_tokens_in": 8000.0, "avg_total_tokens_out": 2350.0, "avg_total_tokens_cached": 3700.0, "avg_duration_seconds": 70.0, "avg_retry_count": 0.67, "avg_peer_handoff_count": 1.8, "hitl_escalations": [{"cause": "loop_detected", "trigger": "loop_detected", "agent": "coder"}]},
+        {"instance_id": "requests__requests-6028", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.88, "avg_cost_caching_on_usd": 0.62, "avg_total_tokens_in": 8500.0, "avg_total_tokens_out": 2500.0, "avg_total_tokens_cached": 4000.0, "avg_duration_seconds": 75.0, "avg_retry_count": 0.67, "avg_peer_handoff_count": 1.2, "hitl_escalations": [{"cause": "loop_detected", "trigger": "loop_detected", "agent": "coder"}]},
+        {"instance_id": "scikit-learn__scikit-learn-13241", "success_rate": 0.6667, "avg_cost_caching_off_usd": 0.78, "avg_cost_caching_on_usd": 0.55, "avg_total_tokens_in": 7600.0, "avg_total_tokens_out": 2200.0, "avg_total_tokens_cached": 3400.0, "avg_duration_seconds": 65.0, "avg_retry_count": 0.0, "avg_peer_handoff_count": 1.0, "hitl_escalations": []},
+        {"instance_id": "sympy__sympy-20049", "success_rate": 0.0, "avg_cost_caching_off_usd": 0.90, "avg_cost_caching_on_usd": 0.64, "avg_total_tokens_in": 8800.0, "avg_total_tokens_out": 2600.0, "avg_total_tokens_cached": 4200.0, "avg_duration_seconds": 78.0, "avg_retry_count": 0.67, "avg_peer_handoff_count": 1.5, "hitl_escalations": [{"cause": "uncertainty_escalation", "trigger": "persistent_test_failure", "agent": "qa"}]},
+        {"instance_id": "django__django-15388", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.80, "avg_cost_caching_on_usd": 0.57, "avg_total_tokens_in": 7800.0, "avg_total_tokens_out": 2300.0, "avg_total_tokens_cached": 3600.0, "avg_duration_seconds": 68.5, "avg_retry_count": 0.33, "avg_peer_handoff_count": 1.2, "hitl_escalations": []},
+        {"instance_id": "flask__flask-4992", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.75, "avg_cost_caching_on_usd": 0.53, "avg_total_tokens_in": 7300.0, "avg_total_tokens_out": 2100.0, "avg_total_tokens_cached": 3200.0, "avg_duration_seconds": 63.0, "avg_retry_count": 0.0, "avg_peer_handoff_count": 0.8, "hitl_escalations": []},
+        {"instance_id": "requests__requests-8694", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.82, "avg_cost_caching_on_usd": 0.58, "avg_total_tokens_in": 8000.0, "avg_total_tokens_out": 2350.0, "avg_total_tokens_cached": 3700.0, "avg_duration_seconds": 70.5, "avg_retry_count": 0.33, "avg_peer_handoff_count": 1.3, "hitl_escalations": []},
+        {"instance_id": "matplotlib__matplotlib-23314", "success_rate": 0.3333, "avg_cost_caching_off_usd": 0.72, "avg_cost_caching_on_usd": 0.51, "avg_total_tokens_in": 7000.0, "avg_total_tokens_out": 2050.0, "avg_total_tokens_cached": 3000.0, "avg_duration_seconds": 60.0, "avg_retry_count": 0.0, "avg_peer_handoff_count": 1.0, "hitl_escalations": []}
+      ]
+    }
+  ]
+}

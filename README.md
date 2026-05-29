@@ -64,7 +64,11 @@ Built across 6 milestones demonstrating production-grade multi-agent engineering
 
 Full benchmark matrix: **3 topologies × 10 SWE-bench-Lite instances × N=3 runs** (≈90 executions).
 
-> Results below are from run `m6-full-matrix-001` with 10 instances, 3 runs per cell, temperature=0.
+> **Illustrative sample output.** The figures below come from `benchmarks/results/m6-full-matrix-001.json`,
+> a synthetic sample dataset (round token counts, a fixed 12-hour window) used to exercise and showcase the
+> aggregation + charting pipeline. They demonstrate the harness's output format and analysis code — they are
+> **not** the result of a real SWE-bench run. The harness in `src/benchmarks/swebench/` runs the real matrix;
+> executing it requires credentials and incurs LLM cost.
 
 ### Results Summary
 

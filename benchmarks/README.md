@@ -1,5 +1,8 @@
 # SDLC-Swarm Benchmark Results
 
+> **Note:** `results/m6-full-matrix-001.json` is a synthetic sample dataset that demonstrates the harness
+> output format and the analysis/charting pipeline. It is not a real benchmark run.
+
 ## Run Metadata
 
 - **Run ID:** `m6-full-matrix-001`
