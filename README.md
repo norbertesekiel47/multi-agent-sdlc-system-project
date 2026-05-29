@@ -1,5 +1,11 @@
 # SDLC-Swarm
 
+[![CI](https://github.com/Nartey7/MultiAgenticSystem/actions/workflows/ci.yml/badge.svg)](https://github.com/Nartey7/MultiAgenticSystem/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.14-blue)
+![Checked with mypy](https://img.shields.io/badge/mypy-strict-2a6db2)
+![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
 Autonomous multi-agent system that takes a GitHub issue on an existing repository and produces a reviewed, tested pull request. All generated code is executed in an ephemeral Docker sandbox with a human-in-the-loop approval before the PR opens.
 
 Built across 6 milestones demonstrating production-grade multi-agent engineering across four pillars: **orchestration**, **observability**, **failure recovery**, and **cost control**.
