@@ -70,7 +70,7 @@ warn_return_any = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["docker", "docker.errors", "docker.models", "docker.models.containers", "docker.models.networks", "yaml"]
+module = ["docker", "docker.errors", "docker.models", "docker.models.containers", "docker.models.networks", "yaml", "langgraph.checkpoint.postgres", "langgraph.checkpoint.postgres.aio"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
