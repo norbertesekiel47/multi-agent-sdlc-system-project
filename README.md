@@ -1,6 +1,6 @@
 # SDLC-Swarm
 
-[![CI](https://github.com/Nartey7/MultiAgenticSystem/actions/workflows/ci.yml/badge.svg)](https://github.com/Nartey7/MultiAgenticSystem/actions/workflows/ci.yml)
+[![CI](https://github.com/norbertesekiel47/multi-agent-sdlc-system-project/actions/workflows/ci.yml/badge.svg)](https://github.com/norbertesekiel47/multi-agent-sdlc-system-project/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.14-blue)
 ![Checked with mypy](https://img.shields.io/badge/mypy-strict-2a6db2)
 ![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)
