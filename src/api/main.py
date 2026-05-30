@@ -113,7 +113,7 @@ async def get_store() -> EpisodicStore:
 
     The store is shared across requests and lazily connected.
     """
-    global _store  # noqa: PLW0603
+    global _store
     if _store is None or _store._pool is None:
         _store = EpisodicStore()
         await _store.connect()
@@ -123,7 +123,7 @@ async def get_store() -> EpisodicStore:
 @app.on_event("shutdown")
 async def _shutdown_store() -> None:
     """Close the shared store pool on shutdown."""
-    global _store  # noqa: PLW0603
+    global _store
     if _store is not None:
         await _store.close()
         _store = None

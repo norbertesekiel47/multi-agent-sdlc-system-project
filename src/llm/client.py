@@ -452,7 +452,7 @@ _embedding_client: EmbeddingClient | None = None
 
 def get_llm_client() -> LLMClient:
     """Return the module-level LLMClient singleton."""
-    global _llm_client  # noqa: PLW0603
+    global _llm_client
     if _llm_client is None:
         _llm_client = LLMClient()
     return _llm_client
@@ -460,7 +460,7 @@ def get_llm_client() -> LLMClient:
 
 def get_embedding_client() -> EmbeddingClient:
     """Return the module-level EmbeddingClient singleton."""
-    global _embedding_client  # noqa: PLW0603
+    global _embedding_client
     if _embedding_client is None:
         _embedding_client = EmbeddingClient()
     return _embedding_client

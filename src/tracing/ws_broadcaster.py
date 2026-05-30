@@ -190,7 +190,7 @@ _broadcaster: TraceBroadcaster | None = None
 
 def get_trace_broadcaster() -> TraceBroadcaster:
     """Return the module-level TraceBroadcaster singleton."""
-    global _broadcaster  # noqa: PLW0603
+    global _broadcaster
     if _broadcaster is None:
         _broadcaster = TraceBroadcaster()
     return _broadcaster

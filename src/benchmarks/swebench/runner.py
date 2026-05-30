@@ -386,28 +386,28 @@ class SweBenchRunner:
             build_graph = build_single_agent_graph
 
             # Define no-op register/unregister for single_agent path
-            def register_sandbox(tid: str, sb: SandboxManager) -> None:  # type: ignore[misc]  # noqa: ANN001
+            def register_sandbox(tid: str, sb: SandboxManager) -> None:  # type: ignore[misc]
                 pass
 
-            def register_store(tid: str, st: EpisodicStore) -> None:  # type: ignore[misc]  # noqa: ANN001
+            def register_store(tid: str, st: EpisodicStore) -> None:  # type: ignore[misc]
                 pass
 
-            def register_semantic_store(tid: str, ss: SemanticStore) -> None:  # type: ignore[misc]  # noqa: ANN001
+            def register_semantic_store(tid: str, ss: SemanticStore) -> None:  # type: ignore[misc]
                 pass
 
-            def register_guardrail(tid: str, g: Any) -> None:  # type: ignore[misc]  # noqa: ANN001
+            def register_guardrail(tid: str, g: Any) -> None:  # type: ignore[misc]
                 pass
 
-            def unregister_sandbox(tid: str) -> None:  # type: ignore[misc]  # noqa: ANN001
+            def unregister_sandbox(tid: str) -> None:  # type: ignore[misc]
                 pass
 
-            def unregister_store(tid: str) -> EpisodicStore | None:  # type: ignore[misc]  # noqa: ANN001
+            def unregister_store(tid: str) -> EpisodicStore | None:  # type: ignore[misc]
                 return None
 
-            def unregister_semantic_store(tid: str) -> SemanticStore | None:  # type: ignore[misc]  # noqa: ANN001
+            def unregister_semantic_store(tid: str) -> SemanticStore | None:  # type: ignore[misc]
                 return None
 
-            def unregister_guardrail(tid: str) -> Any:  # type: ignore[misc]  # noqa: ANN001
+            def unregister_guardrail(tid: str) -> Any:  # type: ignore[misc]
                 return None
         else:
             msg = f"Unknown topology: {self.config.topology!r}"

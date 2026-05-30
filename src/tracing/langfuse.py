@@ -38,7 +38,7 @@ _TRUNCATION_MARKER = "…[truncated]"
 
 def _redact_secrets(text: str) -> str:
     """Replace known secret patterns in *text* with ``***REDACTED***``."""
-    return SecretRedactionFilter._redact(text)  # noqa: SLF001
+    return SecretRedactionFilter._redact(text)
 
 
 def _truncate_and_redact(payload: Any) -> str:
@@ -363,7 +363,7 @@ _tracing_client: TracingClient | None = None
 
 def get_tracing_client() -> TracingClient:
     """Return the module-level TracingClient singleton."""
-    global _tracing_client  # noqa: PLW0603
+    global _tracing_client
     if _tracing_client is None:
         _tracing_client = TracingClient()
     return _tracing_client
@@ -371,5 +371,5 @@ def get_tracing_client() -> TracingClient:
 
 def reset_tracing_client() -> None:
     """Reset the singleton (for testing)."""
-    global _tracing_client  # noqa: PLW0603
+    global _tracing_client
     _tracing_client = None

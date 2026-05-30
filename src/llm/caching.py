@@ -58,7 +58,7 @@ def set_caching_enabled(enabled: bool) -> None:
     This is useful for testing the semantic invariant that
     caching ON vs OFF produces identical output at temperature=0.
     """
-    global _caching_enabled  # noqa: PLW0603
+    global _caching_enabled
     _caching_enabled = enabled
 
 

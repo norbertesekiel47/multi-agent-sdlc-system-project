@@ -36,7 +36,7 @@ class GuardrailViolation(Exception):  # noqa: N818
         self.tool_name = tool_name
         # Redact secrets from the args_summary before storing
         self._args_summary_raw = args_summary
-        self.args_summary = SecretRedactionFilter._redact(args_summary)  # noqa: SLF001
+        self.args_summary = SecretRedactionFilter._redact(args_summary)
         self.detail = detail
         super().__init__(
             f"Guardrail violation: rule={rule_name}, tool={tool_name}: {detail}"

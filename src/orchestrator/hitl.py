@@ -53,7 +53,7 @@ def get_shared_checkpointer() -> MemorySaver:
     Creates one lazily if it doesn't exist yet.
     For production, use get_postgres_checkpointer() instead.
     """
-    global _shared_memory_saver  # noqa: PLW0603
+    global _shared_memory_saver
     if _shared_memory_saver is None:
         _shared_memory_saver = MemorySaver()
     return _shared_memory_saver
@@ -69,7 +69,7 @@ def get_postgres_checkpointer() -> Any:
         import importlib.util
 
         if importlib.util.find_spec("langgraph.checkpoint.postgres.aio") is None:
-            raise ImportError("langgraph-checkpoint-postgres not installed")  # noqa: TRY301
+            raise ImportError("langgraph-checkpoint-postgres not installed")
 
         dsn = (
             f"postgresql://{os.getenv('POSTGRES_USER', 'sdlc_swarm')}"
