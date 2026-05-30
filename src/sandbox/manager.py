@@ -325,7 +325,7 @@ class SandboxManager:
         except docker.errors.NotFound:
             return
         except Exception:
-            pass
+            logger.debug("container stop failed; proceeding to force-remove", exc_info=True)
         with contextlib.suppress(docker.errors.NotFound):
             container.remove(force=True)
 
@@ -554,6 +554,6 @@ class SandboxManager:
                 network.remove()
                 removed += 1
             except Exception:
-                pass
+                logger.debug("stale network removal failed; skipping", exc_info=True)
 
         return removed

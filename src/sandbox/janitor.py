@@ -105,5 +105,5 @@ def _container_created_timestamp(
 
         dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
         return dt.timestamp()
-    except Exception:
+    except (ValueError, TypeError):
         return None
