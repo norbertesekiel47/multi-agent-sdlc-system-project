@@ -39,10 +39,9 @@ from __future__ import annotations
 
 import logging
 import os
-from collections import deque
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any
 from uuid import UUID, uuid4
 
 from langgraph.graph import END, START, StateGraph
@@ -50,11 +49,9 @@ from langgraph.types import interrupt
 from pydantic import ValidationError
 
 from src.agents.models import ChangePlan, CodeEdit, IssueContext, ReviewResult, TestReport
-from src.failure_modes.uncertainty import UncertaintyEscalation
 from src.github_client.client import GitHubClient, canonicalize_repo_url
 from src.llm.cost import estimate_cost_tiktoken, get_max_cost_per_task
 from src.orchestrator import OrchestratorState
-from src.sandbox.manager import SandboxManager
 from src.tracing.langfuse import SpanType, get_tracing_client
 from src.tracing.ws_broadcaster import TraceEvent, get_trace_broadcaster
 
@@ -80,1255 +77,113 @@ def _trunc_json(obj: Any, max_len: int = 500) -> str:
     return raw
 
 
-# ── Sandbox Registry ───────────────────────────────────────────────
-# LangGraph serializes state between nodes, so SandboxManager
-# objects cannot live in the state.  Instead, we use a task-scoped
-# registry that nodes look up by task_id.  The Orchestrator
-# provisions the sandbox before the graph runs and tears it down
-# after.
-
-_active_sandboxes: dict[str, SandboxManager] = {}
-
-
-def register_sandbox(task_id: str, sandbox: SandboxManager) -> None:
-    """Register a sandbox for a task (called by Orchestrator before graph)."""
-    _active_sandboxes[task_id] = sandbox
-
-
-def get_sandbox(task_id: str) -> SandboxManager | None:
-    """Look up the sandbox for a task (called by node functions)."""
-    return _active_sandboxes.get(task_id)
-
-
-def unregister_sandbox(task_id: str) -> None:
-    """Remove a sandbox from the registry (called by Orchestrator after graph)."""
-    _active_sandboxes.pop(task_id, None)
-
-
-# ── Episodic Store Registry ─────────────────────────────────────────
-# Same pattern as sandbox — store reference can't be serialized.
-
-from src.memory.episodic.store import EpisodicStore  # noqa: E402
-from src.memory.semantic.store import SemanticStore  # noqa: E402
-
-_active_stores: dict[str, EpisodicStore] = {}
-_active_semantic_stores: dict[str, SemanticStore] = {}
-
-
-def register_store(task_id: str, store: EpisodicStore) -> None:
-    """Register an episodic store for a task."""
-    _active_stores[task_id] = store
-
-
-def get_store(task_id: str) -> EpisodicStore | None:
-    """Look up the episodic store for a task."""
-    return _active_stores.get(task_id)
-
-
-def unregister_store(task_id: str) -> None:
-    """Remove an episodic store from the registry."""
-    _active_stores.pop(task_id, None)
-
-
-def register_semantic_store(task_id: str, store: SemanticStore) -> None:
-    """Register a semantic store for a task."""
-    _active_semantic_stores[task_id] = store
-
-
-def get_semantic_store(task_id: str) -> SemanticStore | None:
-    """Look up the semantic store for a task."""
-    return _active_semantic_stores.get(task_id)
-
-
-def unregister_semantic_store(task_id: str) -> SemanticStore | None:
-    """Remove a semantic store from the registry and return it."""
-    return _active_semantic_stores.pop(task_id, None)
-
-
-# ── Guardrail Registry ────────────────────────────────────────────
-# Invariant guardrails (VAL-GUARDRAIL-001 through VAL-GUARDRAIL-011).
-# The GuardrailSandboxProxy wraps the SandboxManager and intercepts
-# tool calls before dispatch.
+# ── Per-task registries ────────────────────────────────────────────
+# Sandbox, episodic-store, semantic-store, and guardrail handles live
+# in src.orchestrator.registries (non-serializable, looked up by
+# task_id).  They are re-exported here because hybrid.py imports them
+# from this module and tests patch them at this path.
 
 from src.guardrails.errors import GuardrailViolation  # noqa: E402
-from src.guardrails.middleware import (  # noqa: E402
-    GuardrailMiddleware,
-    GuardrailSandboxProxy,
+
+# Failure-mode + cost bookkeeping helpers live in
+# src.orchestrator.bookkeeping.  Re-exported here because hybrid.py
+# imports some of them from this module and tests patch/import them at
+# this path.
+from src.orchestrator.bookkeeping import (  # noqa: E402
+    _accumulate_agent_cost,
+    _check_loop_detection,
+    _get_tool_call_history_update,
+    _reconstruct_uncertainty,
+    _record_diff_rejection_check,
+    _record_pydantic_failure,
+    _record_pydantic_success,
+    _record_tool_call_and_check,
+    _sync_uncertainty_to_state,
 )
 
-_active_guardrails: dict[str, GuardrailMiddleware] = {}
-_active_sandbox_proxies: dict[str, GuardrailSandboxProxy] = {}
-
-
-def register_guardrail(task_id: str, guardrail: GuardrailMiddleware) -> None:
-    """Register a guardrail middleware and sandbox proxy for a task.
-
-    Creates a GuardrailSandboxProxy wrapping the task's sandbox
-    so that agent tool calls go through guardrail checks.
-    """
-    _active_guardrails[task_id] = guardrail
-    sandbox = get_sandbox(task_id)
-    if sandbox is not None:
-        proxy = GuardrailSandboxProxy(sandbox, guardrail)
-        _active_sandbox_proxies[task_id] = proxy
-
-
-def get_guardrail(task_id: str) -> GuardrailMiddleware | None:
-    """Look up the guardrail middleware for a task."""
-    return _active_guardrails.get(task_id)
-
-
-def get_sandbox_proxy(task_id: str) -> GuardrailSandboxProxy | None:
-    """Look up the guardrail-wrapped sandbox proxy for a task.
-
-    This should be used in agent deps instead of the raw sandbox
-    so that all tool calls go through guardrail checks.
-    """
-    return _active_sandbox_proxies.get(task_id)
-
-
-def unregister_guardrail(task_id: str) -> None:
-    """Remove guardrail and proxy from the registry."""
-    _active_guardrails.pop(task_id, None)
-    _active_sandbox_proxies.pop(task_id, None)
-
-
-# ── Recording Sandbox Proxy ───────────────────────────────────────
-# Wraps the GuardrailSandboxProxy to record tool calls for
-# loop detection and uncertainty escalation tracking.
-# After each agent turn, the orchestrator reads the recorded
-# tool calls and processes them through _check_loop_detection
-# and _record_tool_call_and_check.
-
-
-class _ToolCallRecord:
-    """A single recorded tool call with outcome."""
-
-    __slots__ = ("tool_name", "args", "success", "error_msg")
-
-    def __init__(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        success: bool,
-        error_msg: str = "",
-    ) -> None:
-        self.tool_name = tool_name
-        self.args = args
-        self.success = success
-        self.error_msg = error_msg
-
-
-# Per-task list of tool call recordings (cleared after each agent turn)
-_tool_call_recordings: dict[str, list[_ToolCallRecord]] = {}
-
-
-def _get_recordings(task_id: str) -> list[_ToolCallRecord]:
-    """Get the tool call recordings for a task."""
-    return _tool_call_recordings.get(task_id, [])
-
-
-def _clear_recordings(task_id: str) -> None:
-    """Clear the tool call recordings for a task."""
-    _tool_call_recordings.pop(task_id, None)
-
-
-class RecordingSandboxProxy:
-    """Wraps a GuardrailSandboxProxy to record tool call outcomes.
-
-    Agents receive this proxy as their ``sandbox_manager`` dep.
-    Every tool call is recorded for loop detection and uncertainty
-    escalation tracking.  The orchestrator reads the recordings
-    after each agent turn and processes them.
-    """
-
-    def __init__(self, inner: GuardrailSandboxProxy, task_id: str) -> None:
-        self._inner = inner
-        self._task_id = task_id
-        if task_id not in _tool_call_recordings:
-            _tool_call_recordings[task_id] = []
-
-    def _record(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        success: bool,
-        error_msg: str = "",
-    ) -> None:
-        _tool_call_recordings.setdefault(self._task_id, []).append(
-            _ToolCallRecord(tool_name, args, success, error_msg)
-        )
-
-    # ── Tool surface (record + delegate) ─────────────────────────
-
-    async def run_command(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        timeout: int | None = None,
-    ) -> str:
-        """Execute a command and record the outcome."""
-        try:
-            result = await self._inner.run_command(command, cwd=cwd, timeout=timeout)
-            self._record("run_command", {"command": command}, success=True)
-            return result
-        except Exception as exc:
-            self._record(
-                "run_command",
-                {"command": command},
-                success=False,
-                error_msg=str(exc)[:200],
-            )
-            raise
-
-    async def write_file(self, path: str, content: str) -> None:
-        """Write a file and record the outcome."""
-        try:
-            await self._inner.write_file(path, content)
-            self._record("write_file", {"path": path}, success=True)
-        except Exception as exc:
-            self._record("write_file", {"path": path}, success=False, error_msg=str(exc)[:200])
-            raise
-
-    async def read_file(self, path: str) -> str:
-        """Read a file and record the outcome."""
-        try:
-            result = await self._inner.read_file(path)
-            self._record("read_file", {"path": path}, success=True)
-            return result
-        except Exception as exc:
-            self._record("read_file", {"path": path}, success=False, error_msg=str(exc)[:200])
-            raise
-
-    async def apply_diff(self, diff: str) -> None:
-        """Apply a diff and record the outcome."""
-        try:
-            await self._inner.apply_diff(diff)
-            self._record("apply_diff", {"diff_length": len(diff)}, success=True)
-        except Exception as exc:
-            self._record(
-                "apply_diff",
-                {"diff_length": len(diff)},
-                success=False,
-                error_msg=str(exc)[:200],
-            )
-            raise
-
-    async def run_tests(self, test_command: str = "pytest") -> str:
-        """Run tests and record the outcome."""
-        try:
-            result = await self._inner.run_tests(test_command)
-            self._record("run_tests", {"test_command": test_command}, success=True)
-            return result
-        except Exception as exc:
-            self._record(
-                "run_tests",
-                {"test_command": test_command},
-                success=False,
-                error_msg=str(exc)[:200],
-            )
-            raise
-
-    # ── Direct delegation (no recording) ─────────────────────────
-
-    @property
-    def is_running(self) -> bool:
-        return self._inner.is_running
-
-    @property
-    def container_id(self) -> str | None:
-        return self._inner.container_id
-
-    @property
-    def task_id(self) -> str:
-        return self._task_id
-
-    @property
-    def workspace_dir(self) -> Any:
-        return self._inner.workspace_dir
-
-    async def setup(self) -> None:
-        await self._inner.setup()
-
-    async def teardown(self) -> None:
-        await self._inner.teardown()
-
-    @property
-    def unwrapped(self) -> GuardrailSandboxProxy:
-        """Return the underlying GuardrailSandboxProxy."""
-        return self._inner
-
-
-def get_recording_proxy(task_id: str) -> RecordingSandboxProxy | None:
-    """Create a RecordingSandboxProxy wrapping the guardrail proxy.
-
-    Returns None if no guardrail proxy exists for the task.
-    """
-    base_proxy = get_sandbox_proxy(task_id)
-    if base_proxy is None:
-        return None
-    return RecordingSandboxProxy(base_proxy, task_id)
-
-
-async def _process_tool_call_recordings(
-    *,
-    agent_name: str,
-    step_index: int,
-    state: OrchestratorState,
-    trace_id: str,
-    parent_span_id: str | None,
-) -> dict[str, Any] | None:
-    """Process tool call recordings from the last agent turn.
-
-    Reads the recordings from the per-task registry, processes them
-    through loop detection and uncertainty escalation, and returns
-    a state update dict if escalation is detected.
-
-    This is called after each agent node completes. It:
-    1. Processes each recorded tool call through _check_loop_detection
-    2. Records tool call outcomes for uncertainty escalation
-    3. Returns an escalation state update if triggered, or None
-    """
-    recordings = _get_recordings(state.task_id)
-    if not recordings:
-        return None
-
-    # Process each recording
-    accumulated_update: dict[str, Any] = {}
-    for rec in recordings:
-        # Record tool call for uncertainty escalation (tool error rate)
-        ue = _reconstruct_uncertainty(state)
-        # Merge any accumulated updates into the state we use
-        if accumulated_update.get("tool_error_windows"):
-            state_data = state.model_dump()
-            state_data.update(accumulated_update)
-            # Reconstruct state with updated fields
-            ue._tool_error_windows = {
-                k: deque(v, maxlen=10)
-                for k, v in state_data.get("tool_error_windows", {}).items()
-            }
-
-        trigger = ue.record_tool_call(agent_name, rec.success, step_index)
-        ue_update = _sync_uncertainty_to_state(ue)
-        accumulated_update.update(ue_update)
-
-        # Check loop detection for this tool call
-        loop_result = await _check_loop_detection(
-            agent_name=agent_name,
-            tool_name=rec.tool_name,
-            args=rec.args,
-            state=state,
-            trace_id=trace_id,
-            parent_span_id=parent_span_id,
-        )
-        if loop_result is not None:
-            # Loop detected — return immediately
-            loop_result.update(ue_update)
-            _clear_recordings(state.task_id)
-            return loop_result
-
-        # Update tool call history
-        history_update = _get_tool_call_history_update(
-            agent_name, rec.tool_name, rec.args, state,
-        )
-        accumulated_update["tool_call_history"] = history_update
-
-        if trigger is not None:
-            # Tool error rate exceeded → uncertainty escalation
-            logger.warning(
-                "Uncertainty escalation: %s after tool call %s by %s",
-                trigger.trigger, rec.tool_name, agent_name,
-            )
-            # Report to Langfuse
-            tracing = get_tracing_client()
-            tracing.create_span(
-                trace_id=trace_id,
-                parent_span_id=parent_span_id,
-                name="failure_mode.uncertainty_escalation",
-                span_type=SpanType.SPAN,
-                input_data={"tool_name": rec.tool_name, "agent_name": agent_name},
-                output_data=trigger.to_outcome_data(),
-                metadata={
-                    "failure_mode": "uncertainty_escalation",
-                    "trigger": trigger.trigger,
-                    "agent_name": agent_name,
-                },
-                start_time=datetime.now(UTC),
-                end_time=datetime.now(UTC),
-                level="ERROR",
-            )
-
-            # Write outcome
-            store = get_store(state.task_id)
-            if store is not None:
-                from src.memory.episodic.models import CreateOutcomeParams
-                await store.create_outcome(
-                    CreateOutcomeParams(
-                        task_id=UUID(state.task_id),
-                        outcome="uncertainty_escalation",
-                        detail=trigger.to_outcome_data()["detail"],
-                    ),
-                )
-
-            _clear_recordings(state.task_id)
-            return {
-                "errors": [
-                    f"Uncertainty escalation: {trigger.trigger} for agent {agent_name}"
-                ],
-                "outcome": "uncertainty_escalation",
-                "status": "awaiting_hitl",
-                **accumulated_update,
-            }
-
-    # Clear recordings for the next agent turn
-    _clear_recordings(state.task_id)
-
-    # Return accumulated updates if any changed
-    has_changes = any(
-        accumulated_update.get(k) != getattr(state, k, None)
-        for k in ("tool_call_history", "tool_error_windows", "uncertainty_fired")
-    )
-    return accumulated_update if has_changes else None
-
-
-async def _handle_guardrail_violation(
-    *,
-    violation: GuardrailViolation,
-    task_id: str,
-    trace_id: str,
-    span_id: str | None,
-    parent_span_id: str | None,
-) -> dict[str, Any]:
-    """Handle a GuardrailViolation from an agent tool call.
-
-    VAL-GUARDRAIL-007: Emits a Langfuse span tagged guardrail.violation.
-    VAL-GUARDRAIL-008: Writes an outcomes row with outcome=guardrail_block.
-    VAL-GUARDRAIL-009: Halts the agent and escalates to HITL.
-
-    Returns the state update dict that the calling node should return.
-    The caller must then trigger interrupt() for HITL escalation.
-    """
-    from src.guardrails.middleware import report_guardrail_violation
-
-    await report_guardrail_violation(
-        violation=violation,
-        task_id=task_id,
-        trace_id=trace_id,
-        parent_span_id=parent_span_id,
-    )
-
-    logger.warning(
-        "Guardrail violation in task %s: rule=%s, tool=%s",
-        task_id,
-        violation.rule_name,
-        violation.tool_name,
-    )
-
-    # Return state update for the node — the graph's HITL interrupt
-    # node will pick this up and trigger interrupt()
-    return {
-        "errors": [f"Guardrail violation: {violation.rule_name} — {violation.detail}"],
-        "outcome": "guardrail_block",
-        "status": "awaiting_hitl",
-    }
-
-
-# ── Guardrail escalation HITL node (VAL-GUARDRAIL-009) ──────────────
-
-
-async def hitl_guardrail_escalation(state: OrchestratorState) -> dict[str, Any]:
-    """Node: HITL interrupt for guardrail violation escalation.
-
-    VAL-GUARDRAIL-009: When a guardrail rule fires, the offending
-    agent is halted and the orchestrator raises a LangGraph interrupt()
-    that surfaces the violation to HITL with the rule name and a
-    human-readable explanation.
-
-    The violating agent node catches the GuardrailViolation, writes
-    the Langfuse span and outcomes row, then routes here.  This node
-    fires interrupt() with the violation details, pausing the graph
-    until a human reviews and resolves the escalation.
-    """
-    task_id = state.task_id
-    logger.warning(
-        "Guardrail escalation HITL interrupt for task %s, outcome=%s",
-        task_id,
-        state.outcome,
-    )
-
-    # Build violation details from the error messages stored in state
-    error_detail = "; ".join(state.errors) if state.errors else "Unknown guardrail violation"
-
-    # Update task status to awaiting_hitl
-    store = get_store(task_id)
-    if store is not None:
-        await store.update_task_status(UUID(task_id), "awaiting_hitl")
-
-    # Broadcast HITL interrupt event for the dashboard
-    broadcaster = get_trace_broadcaster()
-    trace_id = getattr(state, "trace_id", "") or uuid4().hex
-    await broadcaster.publish(
-        TraceEvent(
-            type="hitl_interrupt",
-            task_id=task_id,
-            trace_id=trace_id,
-            span_id="",
-            parent_span_id="",
-            name="hitl_guardrail_escalation",
-            span_type=SpanType.SPAN,
-            metadata={
-                "cause": "guardrail_block",
-                "detail": error_detail,
-                "outcome": state.outcome,
-            },
-        )
-    )
-
-    # Fire the interrupt — graph pauses here (VAL-GUARDRAIL-009)
-    decision = interrupt({
-        "reason": "guardrail_block",
-        "task_id": task_id,
-        "cause": "guardrail_block",
-        "explanation": error_detail,
-    })
-
-    if decision == "reject" or decision is None:
-        # Rejected or dismissed — end the task
-        if store is not None:
-            from src.memory.episodic.models import CreateOutcomeParams
-            await store.finish_task(UUID(task_id), "rejected", hitl_decision="reject")
-            await store.create_outcome(
-                CreateOutcomeParams(
-                    task_id=UUID(task_id),
-                    outcome="hitl_rejected",
-                    detail={"cause": "guardrail_block", "original_errors": state.errors},
-                )
-            )
-        return {"outcome": "hitl_rejected", "status": "rejected"}
-
-    # Approved — the human has acknowledged the guardrail violation
-    # and chosen to proceed (rare, but possible for e.g. rm -rf
-    # inside a temp build directory that happens to be outside cwd)
-    if store is not None:
-        await store.update_task_status(UUID(task_id), "running")
-
-    return {"hitl_decision": "approve", "outcome": "", "status": "running"}
-
-
-# ── Loop detection HITL escalation node (VAL-LOOP-DETECT-004) ────
-
-
-async def hitl_loop_detected(state: OrchestratorState) -> dict[str, Any]:
-    """Node: HITL interrupt for loop detection escalation.
-
-    VAL-LOOP-DETECT-004: A ``loop_detected`` outcome triggers a
-    LangGraph ``interrupt()`` and surfaces a HITL escalation event
-    on the dashboard with cause ``loop_detected``.
-
-    VAL-CROSS-015: User can abort (reject), producing terminal outcome.
-    VAL-CROSS-016: User can provide guidance (approve with guidance).
-    """
-    task_id = state.task_id
-    logger.warning(
-        "Loop detection HITL interrupt for task %s", task_id,
-    )
-
-    # Update task status to awaiting_hitl
-    store = get_store(task_id)
-    if store is not None:
-        await store.update_task_status(UUID(task_id), "awaiting_hitl")
-
-    # Broadcast HITL interrupt event for the dashboard
-    broadcaster = get_trace_broadcaster()
-    trace_id = getattr(state, "trace_id", "") or uuid4().hex
-
-    # Get loop detection context from errors
-    error_detail = "; ".join(state.errors) if state.errors else "Loop detected"
-
-    await broadcaster.publish(
-        TraceEvent(
-            type="hitl_interrupt",
-            task_id=task_id,
-            trace_id=trace_id,
-            span_id="",
-            parent_span_id="",
-            name="hitl_loop_detected",
-            span_type=SpanType.SPAN,
-            metadata={
-                "cause": "loop_detected",
-                "detail": error_detail,
-                "outcome": state.outcome,
-            },
-        )
-    )
-
-    # Fire the interrupt — graph pauses here
-    decision = interrupt({
-        "reason": "loop_detected",
-        "task_id": task_id,
-        "cause": "loop_detected",
-        "explanation": error_detail,
-    })
-
-    if decision == "reject" or decision is None:
-        # VAL-CROSS-015: Abort path — terminal outcome
-        if store is not None:
-            from src.memory.episodic.models import CreateOutcomeParams
-            await store.finish_task(UUID(task_id), "rejected", hitl_decision="reject")
-            await store.create_outcome(
-                CreateOutcomeParams(
-                    task_id=UUID(task_id),
-                    outcome="loop_detected",
-                    detail={"cause": "loop_detected", "aborted": True},
-                )
-            )
-        return {"outcome": "loop_detected", "status": "failed"}
-
-    # VAL-CROSS-016: Guidance path — resume with injected guidance
-    if store is not None:
-        await store.update_task_status(UUID(task_id), "running")
-
-    return {"hitl_decision": "approve", "outcome": "", "status": "running"}
-
-
-# ── Uncertainty escalation HITL node (VAL-UNCERTAINTY-007) ────────
-
-
-async def hitl_uncertainty_escalation(state: OrchestratorState) -> dict[str, Any]:
-    """Node: HITL interrupt for uncertainty escalation.
-
-    VAL-UNCERTAINTY-007: Every ``uncertainty_escalation`` outcome
-    corresponds to a LangGraph ``interrupt()`` span, surfacing on
-    the dashboard HITL view.
-
-    The user can abort (reject) or provide guidance (approve).
-    """
-    task_id = state.task_id
-    logger.warning(
-        "Uncertainty escalation HITL interrupt for task %s", task_id,
-    )
-
-    # Update task status to awaiting_hitl
-    store = get_store(task_id)
-    if store is not None:
-        await store.update_task_status(UUID(task_id), "awaiting_hitl")
-
-    # Broadcast HITL interrupt event for the dashboard
-    broadcaster = get_trace_broadcaster()
-    trace_id = getattr(state, "trace_id", "") or uuid4().hex
-
-    error_detail = "; ".join(state.errors) if state.errors else "Uncertainty escalation"
-
-    await broadcaster.publish(
-        TraceEvent(
-            type="hitl_interrupt",
-            task_id=task_id,
-            trace_id=trace_id,
-            span_id="",
-            parent_span_id="",
-            name="hitl_uncertainty_escalation",
-            span_type=SpanType.SPAN,
-            metadata={
-                "cause": "uncertainty_escalation",
-                "detail": error_detail,
-                "outcome": state.outcome,
-            },
-        )
-    )
-
-    # Fire the interrupt — graph pauses here
-    decision = interrupt({
-        "reason": "uncertainty_escalation",
-        "task_id": task_id,
-        "cause": "uncertainty_escalation",
-        "explanation": error_detail,
-    })
-
-    if decision == "reject" or decision is None:
-        # Abort — terminal outcome
-        if store is not None:
-            from src.memory.episodic.models import CreateOutcomeParams
-            await store.finish_task(UUID(task_id), "rejected", hitl_decision="reject")
-            await store.create_outcome(
-                CreateOutcomeParams(
-                    task_id=UUID(task_id),
-                    outcome="uncertainty_escalation",
-                    detail={"cause": "uncertainty_escalation", "aborted": True},
-                )
-            )
-        return {"outcome": "uncertainty_escalation", "status": "failed"}
-
-    # Guidance path — resume
-    if store is not None:
-        await store.update_task_status(UUID(task_id), "running")
-
-    return {"hitl_decision": "approve", "outcome": "", "status": "running"}
-
-
-# ── Failure mode check helpers ──────────────────────────────────────
-
-
-async def _check_loop_detection(
-    *,
-    agent_name: str,
-    tool_name: str,
-    args: dict[str, Any],
-    state: OrchestratorState,
-    trace_id: str,
-    parent_span_id: str | None,
-) -> dict[str, Any] | None:
-    """Check if a tool call triggers loop detection.
-
-    Records the tool call in the sliding window and checks for
-    3 identical (tool_name, args_hash) in the last 5 calls.
-
-    Returns a state update dict with outcome='loop_detected' if
-    detected, or None if no loop.
-    """
-    from src.failure_modes.loop_detection import LoopDetector
-
-    # Reconstruct the detector from state
-    detector = LoopDetector(window_size=5, threshold=3)
-
-    # Replay existing tool call history for this agent
-    history = state.tool_call_history.get(agent_name, [])
-    for rec in history:
-        from src.failure_modes.loop_detection import ToolCallRecord
-        detector._windows.setdefault(agent_name, deque(maxlen=5))
-        detector._windows[agent_name].append(
-            ToolCallRecord(
-                tool_name=rec["tool_name"],
-                args_hash=rec["args_hash"],
-            )
-        )
-
-    # Record the new tool call
-    record = detector.record(agent_name, tool_name, args)
-
-    # Check for loop
-    result = detector.check(agent_name)
-
-    if result is not None:
-        # Loop detected — report to Langfuse
-        tracing = get_tracing_client()
-        span_id = tracing.create_span(
-            trace_id=trace_id,
-            parent_span_id=parent_span_id,
-            name="failure_mode.loop_detected",
-            span_type=SpanType.SPAN,
-            input_data={"tool_name": tool_name, "agent_name": agent_name},
-            output_data=result.to_outcome_data(),
-            metadata={
-                "failure_mode": "loop_detected",
-                "agent_name": agent_name,
-                "tool_name": tool_name,
-                "count": result.count,
-            },
-            start_time=datetime.now(UTC),
-            end_time=datetime.now(UTC),
-            level="ERROR",
-        )
-
-        # Broadcast
-        broadcaster = get_trace_broadcaster()
-        await broadcaster.publish(
-            TraceEvent(
-                type="failure_mode",
-                task_id=state.task_id,
-                trace_id=trace_id,
-                span_id=span_id or "",
-                parent_span_id=parent_span_id or "",
-                name="failure_mode.loop_detected",
-                span_type=SpanType.SPAN,
-                metadata=result.to_outcome_data()["detail"],
-            )
-        )
-
-        # Write outcome
-        store = get_store(state.task_id)
-        if store is not None:
-            from src.memory.episodic.models import CreateOutcomeParams
-            await store.create_outcome(
-                CreateOutcomeParams(
-                    task_id=UUID(state.task_id),
-                    outcome="loop_detected",
-                    detail=result.to_outcome_data()["detail"],
-                )
-            )
-
-        # Update tool call history in state
-        new_history = dict(state.tool_call_history)
-        agent_history = list(history)
-        agent_history.append({"tool_name": tool_name, "args_hash": record.args_hash})
-        # Trim to last 5
-        if len(agent_history) > 5:
-            agent_history = agent_history[-5:]
-        new_history[agent_name] = agent_history
-
-        return {
-            "errors": [f"Loop detected: {agent_name} called {tool_name} {result.count} times"],
-            "outcome": "loop_detected",
-            "status": "awaiting_hitl",
-            "tool_call_history": new_history,
-        }
-
-    # No loop — update tool call history and return None
-    new_history = dict(state.tool_call_history)
-    agent_history = list(history)
-    agent_history.append({"tool_name": tool_name, "args_hash": record.args_hash})
-    # Trim to last 5
-    if len(agent_history) > 5:
-        agent_history = agent_history[-5:]
-    new_history[agent_name] = agent_history
-
-    # Return just the history update (no outcome change)
-    # The caller should merge this into state
-    return None
-
-
-def _get_tool_call_history_update(
-    agent_name: str,
-    tool_name: str,
-    args: dict[str, Any],
-    state: OrchestratorState,
-) -> dict[str, list[dict[str, str]]]:
-    """Get the updated tool_call_history after recording a tool call.
-
-    This is a lightweight version that doesn't check for loops —
-    used when the loop detection check is done separately.
-    """
-    from src.failure_modes.loop_detection import compute_args_hash
-
-    args_hash = compute_args_hash(args)
-    new_history = dict(state.tool_call_history)
-    agent_history = list(new_history.get(agent_name, []))
-    agent_history.append({"tool_name": tool_name, "args_hash": args_hash})
-    # Keep only last 5 entries
-    if len(agent_history) > 5:
-        agent_history = agent_history[-5:]
-    new_history[agent_name] = agent_history
-    return new_history
-
-
-# ── Uncertainty Escalation reconstruction from state ──────────────
-
-
-def _reconstruct_uncertainty(state: OrchestratorState) -> UncertaintyEscalation:
-    """Reconstruct an UncertaintyEscalation instance from state fields.
-
-    LangGraph serializes state between nodes, so we can't store
-    live objects.  Instead, we reconstruct from the state fields
-    each time we need to check/record.
-    """
-    from src.failure_modes.uncertainty import UncertaintyEscalation
-
-    ue = UncertaintyEscalation()
-    # Restore internal state from OrchestratorState fields
-    ue._pydantic_fail_counters = dict(state.pydantic_fail_counters)
-    ue._test_failure_count = state.test_failure_count
-    ue._rejected_diff_hashes = dict(state.rejected_diff_hashes)
-    ue._tool_error_windows = {
-        k: deque(v, maxlen=10)
-        for k, v in state.tool_error_windows.items()
-    }
-    ue._trigger_fired = state.uncertainty_fired
-    return ue
-
-
-def _sync_uncertainty_to_state(
-    ue: UncertaintyEscalation,
-) -> dict[str, Any]:
-    """Sync the UncertaintyEscalation state back to a state update dict.
-
-    Returns only the fields that need updating.
-    """
-    return {
-        "pydantic_fail_counters": dict(ue._pydantic_fail_counters),
-        "test_failure_count": ue._test_failure_count,
-        "rejected_diff_hashes": dict(ue._rejected_diff_hashes),
-        "tool_error_windows": {
-            k: list(v) for k, v in ue._tool_error_windows.items()
-        },
-        "uncertainty_fired": ue._trigger_fired,
-    }
-
-
-# ── Record a tool call outcome and check for escalation ──────────
-
-
-async def _record_tool_call_and_check(
-    *,
-    agent_name: str,
-    tool_name: str,
-    args: dict[str, Any],
-    success: bool,
-    step_index: int,
-    state: OrchestratorState,
-    trace_id: str,
-    parent_span_id: str | None,
-) -> dict[str, Any] | None:
-    """Record a tool call outcome and check for loop detection + uncertainty.
-
-    This is called after every tool call dispatched from an agent node.
-    It:
-    1. Records the tool call in the loop detection sliding window
-    2. Checks if loop detection triggers
-    3. Records the tool call success/failure for uncertainty escalation
-    4. Checks if uncertainty escalation triggers
-
-    Returns a state update dict if escalation is detected, or None.
-    """
-    # ── Loop detection ────────────────────────────────────────
-    loop_result = await _check_loop_detection(
-        agent_name=agent_name,
-        tool_name=tool_name,
-        args=args,
-        state=state,
-        trace_id=trace_id,
-        parent_span_id=parent_span_id,
-    )
-    if loop_result is not None:
-        # Loop detected — merge uncertainty state update into the loop result
-        ue = _reconstruct_uncertainty(state)
-        trigger = ue.record_tool_call(agent_name, success, step_index)
-        ue_update = _sync_uncertainty_to_state(ue)
-        loop_result.update(ue_update)
-        return loop_result
-
-    # ── Uncertainty escalation (tool error rate) ──────────────
-    ue = _reconstruct_uncertainty(state)
-    trigger = ue.record_tool_call(agent_name, success, step_index)
-    ue_update = _sync_uncertainty_to_state(ue)
-
-    if trigger is not None:
-        # Tool error rate exceeded → uncertainty escalation
-        logger.warning(
-            "Uncertainty escalation: %s for agent=%s after tool call %s",
-            trigger.trigger, agent_name, tool_name,
-        )
-        # Report to Langfuse
-        tracing = get_tracing_client()
-        tracing.create_span(
-            trace_id=trace_id,
-            parent_span_id=parent_span_id,
-            name="failure_mode.uncertainty_escalation",
-            span_type=SpanType.SPAN,
-            input_data={"tool_name": tool_name, "agent_name": agent_name},
-            output_data=trigger.to_outcome_data(),
-            metadata={
-                "failure_mode": "uncertainty_escalation",
-                "trigger": trigger.trigger,
-                "agent_name": agent_name,
-            },
-            start_time=datetime.now(UTC),
-            end_time=datetime.now(UTC),
-            level="ERROR",
-        )
-
-        # Write outcome
-        store = get_store(state.task_id)
-        if store is not None:
-            from src.memory.episodic.models import CreateOutcomeParams
-            await store.create_outcome(
-                CreateOutcomeParams(
-                    task_id=UUID(state.task_id),
-                    outcome="uncertainty_escalation",
-                    detail=trigger.to_outcome_data()["detail"],
-                )
-            )
-
-        return {
-            "errors": [
-                f"Uncertainty escalation: {trigger.trigger} for agent {agent_name}"
-            ],
-            "outcome": "uncertainty_escalation",
-            "status": "awaiting_hitl",
-            **ue_update,
-        }
-
-    # No escalation — return the updated tool call history and
-    # uncertainty state (the caller should merge these)
-    new_history = _get_tool_call_history_update(agent_name, tool_name, args, state)
-    return {
-        "tool_call_history": new_history,
-        **ue_update,
-    }
-
-
-# ── Record Pydantic validation failure and check escalation ──────
-
-
-def _record_pydantic_failure(
-    *,
-    agent_name: str,
-    step_index: int,
-    state: OrchestratorState,
-) -> dict[str, Any] | None:
-    """Record a Pydantic validation failure and check for escalation.
-
-    Returns a state update dict if escalation is detected, or None.
-    Called when an agent's output fails Pydantic validation.
-    """
-    ue = _reconstruct_uncertainty(state)
-    trigger = ue.record_pydantic_failure(agent_name, step_index)
-    ue_update = _sync_uncertainty_to_state(ue)
-
-    if trigger is not None:
-        logger.warning(
-            "Uncertainty escalation: pydantic_validation_3x for %s:%d",
-            agent_name, step_index,
-        )
-        return {
-            "errors": [
-                f"Uncertainty escalation: pydantic_validation_3x for "
-                f"{agent_name} at step {step_index}"
-            ],
-            "outcome": "uncertainty_escalation",
-            "status": "awaiting_hitl",
-            **ue_update,
-        }
-
-    # No escalation yet — just sync the counter back
-    if ue_update.get("pydantic_fail_counters") == state.pydantic_fail_counters:
-        return None
-    return ue_update
-
-
-def _record_pydantic_success(
-    *,
-    agent_name: str,
-    step_index: int,
-    state: OrchestratorState,
-) -> dict[str, Any]:
-    """Record a successful Pydantic validation (resets counter).
-
-    Returns the state update dict with reset counter.
-    """
-    ue = _reconstruct_uncertainty(state)
-    ue.record_pydantic_success(agent_name, step_index)
-    return _sync_uncertainty_to_state(ue)
-
-
-def _accumulate_agent_cost(
-    *,
-    agent_name: str,
-    tokens_in: int,
-    tokens_out: int,
-    cached_tokens: int,
-    cost_usd: Decimal,
-    state: OrchestratorState,
-) -> dict[str, dict[str, dict[str, int | str]]]:
-    """Return an ``agent_costs`` state update that accumulates per-agent tokens and cost.
-
-    The ``agent_costs`` dict maps agent_name → {
-        "tokens_in": int, "tokens_out": int, "cached_tokens": int,
-        "cost_usd": str  (Decimal serialized as string for JSONB)
-    }.
-    """
-    current = state.agent_costs.copy() if state.agent_costs else {}
-    existing = current.get(agent_name, {})
-    new_tokens_in = int(existing.get("tokens_in", 0)) + tokens_in
-    new_tokens_out = int(existing.get("tokens_out", 0)) + tokens_out
-    new_cached_tokens = int(existing.get("cached_tokens", 0)) + cached_tokens
-    prev_cost = Decimal(str(existing.get("cost_usd", "0")))
-    new_cost = prev_cost + cost_usd
-    current[agent_name] = {
-        "tokens_in": new_tokens_in,
-        "tokens_out": new_tokens_out,
-        "cached_tokens": new_cached_tokens,
-        "cost_usd": str(new_cost),
-    }
-    return {"agent_costs": current}
-
-
-# ── Record diff rejection and check escalation ────────────────────
-
-
-def _record_diff_rejection_check(
-    *,
-    diff_hash: str,
-    agent_name: str,
-    step_index: int,
-    state: OrchestratorState,
-) -> dict[str, Any] | None:
-    """Record a diff rejection and check for same_fix_rejected_twice.
-
-    Called in route_after_review when verdict is reject_with_changes.
-    Returns a state update dict if escalation is detected, or None.
-    """
-    if not diff_hash:
-        return None
-
-    ue = _reconstruct_uncertainty(state)
-    trigger = ue.record_diff_rejection(diff_hash, agent_name, step_index)
-    ue_update = _sync_uncertainty_to_state(ue)
-
-    if trigger is not None:
-        logger.warning(
-            "Uncertainty escalation: same_fix_rejected_twice for hash=%s…",
-            diff_hash[:12],
-        )
-        return {
-            "errors": [
-                f"Uncertainty escalation: same_fix_rejected_twice "
-                f"for diff_hash {diff_hash[:12]}…"
-            ],
-            "outcome": "uncertainty_escalation",
-            "status": "awaiting_hitl",
-            **ue_update,
-        }
-
-    # No escalation — just sync the rejected hashes back
-    if ue_update.get("rejected_diff_hashes") == state.rejected_diff_hashes:
-        return None
-    return ue_update
-
-
-# ── Routing functions ───────────────────────────────────────────────
-
-
-def route_after_planner(
-    state: OrchestratorState,
-) -> Literal[
-    "halt_cost_budget_exhausted",
-    "halt_task_failed",
+# HITL escalation nodes live in src.orchestrator.hitl_nodes.  Re-exported
+# here because hybrid.py imports them from this module and tests
+# patch/import them at this path.
+from src.orchestrator.hitl_nodes import (  # noqa: E402
+    _handle_guardrail_violation,
+    hitl_guardrail_escalation,
+    hitl_loop_detected,
+    hitl_uncertainty_escalation,
+)
+from src.orchestrator.recording import (  # noqa: E402
+    RecordingSandboxProxy,
+    _clear_recordings,
+    _get_recordings,
+    _process_tool_call_recordings,
+    _tool_call_recordings,
+    get_recording_proxy,
+)
+from src.orchestrator.registries import (  # noqa: E402
+    get_guardrail,
+    get_sandbox,
+    get_sandbox_proxy,
+    get_semantic_store,
+    get_store,
+    register_guardrail,
+    register_sandbox,
+    register_semantic_store,
+    register_store,
+    unregister_guardrail,
+    unregister_sandbox,
+    unregister_semantic_store,
+    unregister_store,
+)
+
+# Conditional-edge routing functions live in src.orchestrator.routing.
+# Re-exported here because hybrid.py imports some of them from this
+# module and tests patch/import them at this path.
+from src.orchestrator.routing import (  # noqa: E402
+    route_after_coder,
+    route_after_commit_and_push,
+    route_after_planner,
+    route_after_qa,
+    route_after_review,
+)
+
+__all__ = [
+    "RecordingSandboxProxy",
+    "_accumulate_agent_cost",
+    "_check_loop_detection",
+    "_clear_recordings",
+    "_get_recordings",
+    "_get_tool_call_history_update",
+    "_handle_guardrail_violation",
+    "_process_tool_call_recordings",
+    "_record_diff_rejection_check",
+    "_record_pydantic_failure",
+    "_record_pydantic_success",
+    "_record_tool_call_and_check",
+    "_reconstruct_uncertainty",
+    "_sync_uncertainty_to_state",
+    "_tool_call_recordings",
+    "get_guardrail",
+    "get_recording_proxy",
+    "get_sandbox",
+    "get_sandbox_proxy",
+    "get_semantic_store",
+    "get_store",
     "hitl_guardrail_escalation",
     "hitl_loop_detected",
     "hitl_uncertainty_escalation",
-    "run_coder",
-]:
-    """After Planner, route to guardrail escalation, loop detection,
-    uncertainty escalation, or Coder.
-
-    VAL-GUARDRAIL-009: If a guardrail violation was detected, route
-    to the HITL escalation node.
-    VAL-LOOP-DETECT-004: If loop was detected, route to HITL.
-    VAL-UNCERTAINTY-007: If uncertainty escalation, route to HITL.
-    """
-    if state.outcome == "cost_budget_exhausted":
-        return "halt_cost_budget_exhausted"
-    if state.outcome == "guardrail_block":
-        return "hitl_guardrail_escalation"
-    if state.outcome == "loop_detected":
-        return "hitl_loop_detected"
-    if state.outcome == "uncertainty_escalation":
-        return "hitl_uncertainty_escalation"
-    if state.status == "failed":
-        return "halt_task_failed"
-    return "run_coder"
-
-
-def route_after_coder(
-    state: OrchestratorState,
-) -> Literal[
-    "halt_cost_budget_exhausted",
-    "halt_task_failed",
-    "hitl_guardrail_escalation",
-    "hitl_loop_detected",
-    "hitl_uncertainty_escalation",
-    "run_reviewer",
-]:
-    """After Coder, route to guardrail escalation, loop detection,
-    uncertainty escalation, or Reviewer.
-    """
-    if state.outcome == "cost_budget_exhausted":
-        return "halt_cost_budget_exhausted"
-    if state.outcome == "guardrail_block":
-        return "hitl_guardrail_escalation"
-    if state.outcome == "loop_detected":
-        return "hitl_loop_detected"
-    if state.outcome == "uncertainty_escalation":
-        return "hitl_uncertainty_escalation"
-    if state.status == "failed":
-        return "halt_task_failed"
-    return "run_reviewer"
-
-
-def route_after_review(
-    state: OrchestratorState,
-) -> Literal[
-    "halt_cost_budget_exhausted",
-    "halt_task_failed",
-    "hitl_guardrail_escalation",
-    "hitl_loop_detected",
-    "hitl_uncertainty_escalation",
-    "run_qa",
-    "run_coder",
-    "run_supervisor_finalize",
-    "halt_retry_exhausted",
-]:
-    """After Reviewer, route based on verdict.
-
-    - ``guardrail_block``: escalate to HITL (VAL-GUARDRAIL-009)
-    - ``loop_detected``: escalate to HITL (VAL-LOOP-DETECT-004)
-    - ``uncertainty_escalation``: escalate to HITL (VAL-UNCERTAINTY-007)
-    - ``accept``: advance to QA (VAL-QA-001, VAL-QA-003)
-    - ``reject_with_changes``: re-route to Coder (if retry budget
-      allows), otherwise halt with retry_budget_exhausted
-    - ``reject``: advance to Supervisor finalize (terminal rejection)
-
-    VAL-TOPOLOGY-003: In supervisor_only, the re-route goes through
-    the Supervisor (this routing function IS the Supervisor's
-    routing logic).  There is NO direct Reviewer→Coder peer edge.
-
-    VAL-REVIEWER-004: When ReviewResult.verdict == 'accept', the
-    orchestrator routes to QA next, not back to Coder.
-    """
-    if state.outcome == "cost_budget_exhausted":
-        return "halt_cost_budget_exhausted"
-    # Check for guardrail violations first
-    if state.outcome == "guardrail_block":
-        return "hitl_guardrail_escalation"
-    # Check for loop detection
-    if state.outcome == "loop_detected":
-        return "hitl_loop_detected"
-    # Check for uncertainty escalation
-    if state.outcome == "uncertainty_escalation":
-        return "hitl_uncertainty_escalation"
-    if state.status == "failed":
-        return "halt_task_failed"
-
-    review = state.review_result
-    if review is None:
-        # No review result — should not happen, advance to finalize
-        logger.warning("route_after_review called with no review_result")
-        return "run_supervisor_finalize"
-
-    if review.verdict == "accept":
-        # Accept: advance to QA (VAL-REVIEWER-004, VAL-QA-001)
-        return "run_qa"
-
-    if review.verdict == "reject":
-        # Terminal rejection: advance to finalize (will set outcome)
-        return "run_supervisor_finalize"
-
-    if review.verdict == "reject_with_changes":
-        # Check retry budget for the current coder step
-        step_key = f"coder_{state.step_index}"
-        current_retries = state.retry_counters.get(step_key, 0)
-
-        if current_retries >= _MAX_RETRIES_PER_STEP:
-            # Retry budget exhausted — halt
-            logger.warning(
-                "Retry budget exhausted for %s (task %s): %d attempts",
-                step_key,
-                state.task_id,
-                current_retries,
-            )
-            return "halt_retry_exhausted"
-
-        # Re-route to Coder (sequential loop through Supervisor)
-        logger.info(
-            "Re-routing to Coder after reject_with_changes (attempt %d/%d)",
-            current_retries + 1,
-            _MAX_RETRIES_PER_STEP,
-        )
-        return "run_coder"
-
-    # Unknown verdict — advance to finalize
-    logger.warning("Unknown review verdict: %s", review.verdict)
-    return "run_supervisor_finalize"
+    "register_guardrail",
+    "register_sandbox",
+    "register_semantic_store",
+    "register_store",
+    "route_after_coder",
+    "route_after_commit_and_push",
+    "route_after_planner",
+    "route_after_qa",
+    "route_after_review",
+    "unregister_guardrail",
+    "unregister_sandbox",
+    "unregister_semantic_store",
+    "unregister_store",
+]
 
 
 # ── Helper: emit Langfuse trace events ─────────────────────────────
@@ -2117,62 +972,6 @@ async def run_reviewer(state: OrchestratorState) -> dict[str, Any]:
 # ── Route after QA ──────────────────────────────────────────────────
 
 
-def route_after_qa(
-    state: OrchestratorState,
-) -> Literal[
-    "halt_cost_budget_exhausted",
-    "halt_task_failed",
-    "hitl_guardrail_escalation",
-    "hitl_loop_detected",
-    "hitl_uncertainty_escalation",
-    "run_supervisor_finalize",
-    "halt_test_failure",
-]:
-    """After QA, route based on test results.
-
-    - ``guardrail_block``: escalate to HITL (VAL-GUARDRAIL-009)
-    - ``loop_detected``: escalate to HITL (VAL-LOOP-DETECT-004)
-    - ``uncertainty_escalation``: escalate to HITL (VAL-UNCERTAINTY-007)
-    - All pass (failed == 0): advance to Supervisor finalize (→ PR)
-    - Failures (failed > 0): halt with test failure (VAL-QA-005)
-
-    VAL-QA-005: When TestReport.failed > 0, the orchestrator does
-    NOT proceed to PR creation. It either retries (within budget)
-    or escalates to HITL with cause persistent_test_failure.
-    """
-    if state.outcome == "cost_budget_exhausted":
-        return "halt_cost_budget_exhausted"
-    # Check for guardrail violations first
-    if state.outcome == "guardrail_block":
-        return "hitl_guardrail_escalation"
-    # Check for loop detection
-    if state.outcome == "loop_detected":
-        return "hitl_loop_detected"
-    # Check for uncertainty escalation
-    if state.outcome == "uncertainty_escalation":
-        return "hitl_uncertainty_escalation"
-    if state.status == "failed":
-        return "halt_task_failed"
-
-    report = state.test_report
-    if report is None:
-        # No test report — should not happen, advance to finalize
-        logger.warning("route_after_qa called with no test_report")
-        return "run_supervisor_finalize"
-
-    if report.failed > 0:
-        # Test failures: do NOT open PR (VAL-QA-005)
-        logger.warning(
-            "QA found %d failing test(s) for task %s — NOT opening PR",
-            report.failed,
-            state.task_id,
-        )
-        return "halt_test_failure"
-
-    # All tests pass: advance to finalize
-    return "run_supervisor_finalize"
-
-
 # ── Node: Run QA Agent ──────────────────────────────────────────────
 
 
@@ -2816,15 +1615,6 @@ async def run_commit_and_push(state: OrchestratorState) -> dict[str, Any]:
         }
 
     return {"step": "committed"}
-
-
-def route_after_commit_and_push(
-    state: OrchestratorState,
-) -> Literal["run_open_pr", "halt_github_delivery_failed"]:
-    """Only continue to PR creation after a successful commit/push."""
-    if state.outcome == "github_delivery_failed" or state.status == "failed":
-        return "halt_github_delivery_failed"
-    return "run_open_pr"
 
 
 async def run_open_pr(state: OrchestratorState) -> dict[str, Any]:
