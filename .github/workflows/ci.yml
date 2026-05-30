@@ -15,6 +15,36 @@ jobs:
     name: Python (lint · typecheck · test)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: sdlc_swarm
+          POSTGRES_PASSWORD: sdlc_swarm_dev
+          POSTGRES_DB: sdlc_swarm
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U sdlc_swarm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Mocked unit tests never call these services, but agent modules
+      # construct provider clients at import time and require the keys to
+      # exist. Real-call tests are marked `integration` and excluded here.
+      OPENROUTER_API_KEY: sk-or-ci-dummy
+      OPENAI_API_KEY: sk-ci-dummy
+      GITHUB_PAT: ci-dummy
+      GITHUB_USERNAME: ci-dummy
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5433"
+      POSTGRES_USER: sdlc_swarm
+      POSTGRES_PASSWORD: sdlc_swarm_dev
+      POSTGRES_DB: sdlc_swarm
+
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +63,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+
+      - name: Initialize database schema
+        run: python -m src.db.init_schema
 
       - name: Ruff
         run: ruff check src tests
