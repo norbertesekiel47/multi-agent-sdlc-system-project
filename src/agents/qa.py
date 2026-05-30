@@ -455,7 +455,9 @@ async def run_qa(
                     f"### File: {touched_file}\n```\n{content[:3000]}\n```"
                 )
             except Exception:
-                pass
+                logger.debug(
+                    "repo-context read failed for %s; skipping", touched_file, exc_info=True
+                )
 
     full_repo_context = "\n\n".join(repo_context_parts) if repo_context_parts else ""
 

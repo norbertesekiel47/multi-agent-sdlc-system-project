@@ -464,7 +464,9 @@ async def run_coder(
                     f"### File: {target_file}\n```\n{content[:3000]}\n```"
                 )
             except Exception:
-                pass
+                logger.debug(
+                    "repo-context read failed for %s; skipping", target_file, exc_info=True
+                )
 
     # ── Pre-fetch RAG context ──────────────────────────────────
     if rag_retriever is not None:

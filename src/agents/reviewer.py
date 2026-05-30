@@ -450,7 +450,9 @@ async def run_reviewer(
                     f"### File: {touched_file}\n```\n{content[:3000]}\n```"
                 )
             except Exception:
-                pass
+                logger.debug(
+                    "repo-context read failed for %s; skipping", touched_file, exc_info=True
+                )
 
     # ── Run static analysis (ruff/mypy) ─────────────────────────
     static_analysis_results: list[str] = []
@@ -465,7 +467,9 @@ async def run_reviewer(
                         f"Ruff check of {touched_file}:\n{output[:1000]}"
                     )
             except Exception:
-                pass
+                logger.debug(
+                    "ruff static-analysis step failed for %s; skipping", touched_file, exc_info=True
+                )
             try:
                 output = await sandbox_manager.run_command(
                     f"mypy {touched_file} 2>&1 || true"
@@ -475,7 +479,9 @@ async def run_reviewer(
                         f"Mypy check of {touched_file}:\n{output[:1000]}"
                     )
             except Exception:
-                pass
+                logger.debug(
+                    "mypy static-analysis step failed for %s; skipping", touched_file, exc_info=True
+                )
 
     # ── Run security pattern scanning ───────────────────────────
     security_results: list[str] = []
@@ -491,7 +497,9 @@ async def run_reviewer(
                             f"({len(matches)} occurrence(s))"
                         )
             except Exception:
-                pass
+                logger.debug(
+                    "security-pattern scan failed for %s; skipping", touched_file, exc_info=True
+                )
 
     # Combine repo context with analysis results
     if static_analysis_results:
