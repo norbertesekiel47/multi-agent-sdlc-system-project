@@ -73,8 +73,25 @@ jobs:
       - name: Mypy (strict)
         run: mypy --strict src
 
-      - name: Pytest (non-integration)
-        run: pytest -q -m "not integration" -p no:cacheprovider --cov=src --cov-report=term-missing
+      - name: Pytest (non-integration, no-infra)
+        # Excludes suites that need infrastructure not present on the runner:
+        #   - sandbox/ : custom sdlc-swarm Docker images (built by init.sh)
+        #   - packaging/test_kitops : the `kit` CLI binary
+        #   - memory/test_semantic_store : a real OpenAI embeddings key
+        #   - evals/test_promptfoo_ci : fnm + node-22 + promptfoo
+        #   - TestPromptfooCIPaths : reads a hard-coded absolute local path
+        #   - TestSecretRedactionInSpans : needs real (long) secret values
+        # These are exercised locally/in integration runs, not in unit CI.
+        run: >-
+          pytest -q -m "not integration" -p no:cacheprovider
+          --cov=src --cov-report=term-missing
+          --ignore=tests/sandbox/test_isolation.py
+          --ignore=tests/sandbox/test_apply_diff.py
+          --ignore=tests/packaging/test_kitops.py
+          --ignore=tests/memory/test_semantic_store.py
+          --ignore=tests/evals/test_promptfoo_ci.py
+          --deselect tests/orchestrator/test_scrutiny_wiring.py::TestPromptfooCIPaths
+          --deselect tests/test_backend_tracing.py::TestSecretRedactionInSpans
 
   web:
     name: Web (lint · typecheck · test · build)
