@@ -193,6 +193,7 @@ async def _check_postgres() -> str:
         await conn.close()
         return "ok"
     except Exception:
+        logger.debug("db health probe failed", exc_info=True)
         return "unreachable"
 
 
@@ -209,6 +210,7 @@ async def _check_langfuse() -> str:
                 if resp.status_code < 500:
                     continue
         except Exception:
+            logger.debug("langfuse probe failed for %s; trying next path", url, exc_info=True)
             continue
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
@@ -217,6 +219,7 @@ async def _check_langfuse() -> str:
                 return "ok"
             return "degraded"
     except Exception:
+        logger.debug("langfuse fallback probe failed", exc_info=True)
         return "unreachable"
 
 
@@ -593,6 +596,7 @@ async def events_stream(websocket: WebSocket) -> None:
                 try:
                     await websocket.send_json({"type": "ping"})
                 except Exception:
+                    logger.debug("websocket keepalive ping failed; closing stream", exc_info=True)
                     break
             except WebSocketDisconnect:
                 break

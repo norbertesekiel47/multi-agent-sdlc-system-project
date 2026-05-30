@@ -234,9 +234,11 @@ async def run_single_agent_e2e(
                     content = await sandbox.read_file(filepath)
                     repo_files[filepath] = content[:2000]
                 except Exception:
-                    pass
+                    logger.debug(
+                        "repo-file index read failed for %s; skipping", filepath, exc_info=True
+                    )
     except Exception:
-        pass
+        logger.debug("repo-file indexing failed; continuing with partial context", exc_info=True)
 
     issue_context = IssueContext(
         repo_url=repo_url,

@@ -288,9 +288,13 @@ async def run_planner(state: OrchestratorState) -> dict[str, Any]:
                         content = await sandbox.read_file(filepath)
                         repo_files[filepath] = content[:2000]
                     except Exception:
-                        pass
+                        logger.debug(
+                            "repo-file index read failed for %s; skipping", filepath, exc_info=True
+                        )
         except Exception:
-            pass
+            logger.debug(
+                "repo-file indexing failed; continuing with partial context", exc_info=True
+            )
 
     # ── Episodic memory pre-fetch (VAL-CROSS-013, VAL-CROSS-014) ───
     # Query the episodic store for repo_facts, recent decisions,

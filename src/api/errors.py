@@ -77,7 +77,9 @@ async def validation_exception_handler(request: Request, exc: Exception) -> JSON
                 content={"error": "validation_error", "detail": safe_errors},
             )
         except Exception:
-            pass
+            logger.warning(
+                "validation-error redaction failed; returning generic 422", exc_info=True
+            )
 
     return JSONResponse(
         status_code=422,
